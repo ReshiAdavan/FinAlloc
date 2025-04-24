@@ -5,7 +5,7 @@ custom memory allocator for quant infra
 
 1. clone
 2. run makefile via `make`
-3. run executable via `./finAlloc`
+3. run executable via `./bin/finalloc`
 
 # todos
 
@@ -20,9 +20,9 @@ custom memory allocator for quant infra
 - [ ] HugePage Support (Linux) [Backed by mmap with MAP_HUGETLB or madvise for better TLB performance]
 
 2. pool allocator
-- [ ] Lock-Free Free List [Use std::atomic<void*> with compare-and-swap to allow concurrent allocation/deallocation]
-- [ ] Size-Class Bucketing [Support multiple object sizes by grouping into power-of-two buckets (like tcmalloc)]
-- [ ] Thread-local Buffer Caches [Per-thread pools that reduce global contention and allocate in batches]
+- [X] Lock-Free Free List [Use std::atomic<void*> with compare-and-swap to allow concurrent allocation/deallocation]
+- [X] Size-Class Bucketing [Support multiple object sizes by grouping into power-of-two buckets (like tcmalloc)]
+- [X] Thread-local Buffer Caches [Per-thread pools that reduce global contention and allocate in batches]
 - [ ] Object Lifecycle Hooks [Optional callbacks for constructor/destructor on reuse, even for PODs]
 - [ ] Zeroing or Poisoning Support [Debug mode wipes memory on alloc/dealloc to detect uninitialized accesses]
 - [ ] Usage Metrics and Histograms [Track alloc counts, dealloc counts, high-water marks, fragmentation over time]
