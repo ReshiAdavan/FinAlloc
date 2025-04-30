@@ -20,6 +20,8 @@ public:
 
     size_t used() const { return usedCount; }
     size_t capacity() const { return poolCapacity; }
+    void* memory() const { return memoryBlock; }
+    size_t blockSize() const { return alignedObjSize * poolCapacity; }
 
     template<typename T, typename... Args>
     T* construct(Args&&... args) {
@@ -37,7 +39,7 @@ public:
 
 protected:
     void* memoryBlock;
-    void* freeListHead = nullptr;
+    void* nonAtomicFreeListHead = nullptr;
     size_t alignedObjSize;
     size_t poolCapacity;
     size_t usedCount;
@@ -66,18 +68,22 @@ public:
 
     template<typename T, typename... Args>
     T* construct(Args&&... args) {
-        return getPool()->construct<T>(std::forward<Args>(args)...);
+        return localAllocator.construct<T>(std::forward<Args>(args)...);
     }
 
     template<typename T>
     void destroy(T* ptr) {
-        getPool()->destroy(ptr);
+        localAllocator.destroy(ptr);
+    }
+
+    void* memory() const {
+        return localAllocator.memory();
+    }
+
+    size_t blockSize() const {
+        return localAllocator.blockSize();
     }
 
 private:
-    PoolAllocator* getPool();
-    size_t objSize;
-    size_t poolCapacity;
-
-    static thread_local PoolAllocator* localPool;
+    PoolAllocator localAllocator;
 };
