@@ -1,72 +1,86 @@
-# ---- toolchain ---------------------------------------------------------------
-CXX      := g++
-CXXFLAGS := -std=c++20 -O2 -fsanitize=address -g -Iinclude -MMD -MP
-LDFLAGS  := -fsanitize=address -pthread
+CXX := g++
+CXXFLAGS := -std=c++20 -O2 -fsanitize=address -g -Iinclude -fno-omit-frame-pointer
+LDFLAGS := -fsanitize=address -pthread
 
-# ---- layout -----------------------------------------------------------------
-SRC_DIR  := src
-OBJ_DIR  := build
-BIN_DIR  := bin
+SRC_DIR := src
+OBJ_DIR := build
+BIN_DIR := bin
 TEST_DIR := tests
 
-# All project sources (recursively)
+# Discover all source files under src/
 SRCS := $(shell find $(SRC_DIR) -name '*.cpp')
 OBJS := $(SRCS:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
 DEPS := $(OBJS:.o=.d)
 
-# Optional main (if you have src/main.cpp). If not present, it's fine.
-MAIN_OBJ      := $(OBJ_DIR)/main.o
+# If you have a main.cpp you want to build as the primary binary:
+MAIN_OBJ := $(OBJ_DIR)/main.o
 NON_MAIN_OBJS := $(filter-out $(MAIN_OBJ), $(OBJS))
 
-# App target (optional; only if you have a real main)
 TARGET := $(BIN_DIR)/finalloc
 
-# ---- tests ------------------------------------------------------------------
-TESTS       := allocatorMetricsTest allocatorPerfTest arenaAllocatorTest
-TEST_SRCS   := $(addprefix $(TEST_DIR)/,$(addsuffix .cpp,$(TESTS)))
-TEST_OBJS   := $(TEST_SRCS:$(TEST_DIR)/%.cpp=$(OBJ_DIR)/tests/%.o)
-TEST_BINS   := $(addprefix $(BIN_DIR)/,$(TESTS))
-TEST_DEPS   := $(TEST_OBJS:.o=.d)
+# Tests and benchmarks
+TEST_BINS := \
+  $(BIN_DIR)/allocatorMetricsTest \
+  $(BIN_DIR)/allocatorPerfTest \
+  $(BIN_DIR)/arenaAllocatorTest
 
-# ---- default targets ---------------------------------------------------------
-.PHONY: all clean test
+BENCH_TARGET := $(BIN_DIR)/allocBench
 
-all: $(TARGET)
+# Build everything by default (app + benchmark)
+all: $(TARGET) $(BENCH_TARGET)
 
-# Build the main binary (optional)
-$(TARGET): $(OBJS) | $(BIN_DIR)
+# Primary app (only if you have a main.cpp; otherwise remove this target)
+$(TARGET): $(OBJS)
+	@mkdir -p $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(OBJS) -o $@ $(LDFLAGS)
 
-# Generic rule for project objects
+# Generic compile rule
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
-# ---- tests build rules -------------------------------------------------------
-# Compile each test source to an object
-$(OBJ_DIR)/tests/%.o: $(TEST_DIR)/%.cpp
-	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-# Link each test with all non-main objects from src/
-$(BIN_DIR)/%: $(OBJ_DIR)/tests/%.o $(NON_MAIN_OBJS) | $(BIN_DIR)
+# -----------------------------
+# Tests
+# -----------------------------
+$(BIN_DIR)/allocatorMetricsTest): $(TEST_DIR)/allocatorMetricsTest.cpp $(NON_MAIN_OBJS)
+	@mkdir -p $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-# Convenience rule to build *and* run all tests
-test: $(TEST_BINS)
+$(BIN_DIR)/allocatorPerfTest): $(TEST_DIR)/allocatorPerfTest.cpp $(NON_MAIN_OBJS)
+	@mkdir -p $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BIN_DIR)/arenaAllocatorTest): $(TEST_DIR)/arenaAllocatorTest.cpp $(NON_MAIN_OBJS)
+	@mkdir -p $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+tests: $(TEST_BINS)
+
+test: tests
 	@set -e; \
-	for t in $(TESTS); do \
-		echo "== Running bin/$$t =="; \
-		"./$(BIN_DIR)/$$t"; \
-		echo; \
+	for t in $(notdir $(TEST_BINS)); do \
+	  echo "== Running bin/$$t =="; \
+	  "./bin/$$t"; \
+	  echo ""; \
 	done
 
-# ---- housekeeping ------------------------------------------------------------
-$(BIN_DIR):
+# -----------------------------
+# Benchmark
+# -----------------------------
+$(BENCH_TARGET): $(TEST_DIR)/allocBench.cpp $(NON_MAIN_OBJS)
 	@mkdir -p $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
+bench: $(BENCH_TARGET)
+	@echo "Built $(BENCH_TARGET). Example:"
+	@echo "./bin/allocBench --allocator=pool --threads=8 --iters=100000 --size=64"
+
+# -----------------------------
+# Housekeeping
+# -----------------------------
 clean:
 	rm -rf $(OBJ_DIR) $(BIN_DIR)
 
-# Include auto-generated dep files
--include $(DEPS) $(TEST_DEPS)
+-include $(DEPS)
+
+.PHONY: all tests test bench clean
