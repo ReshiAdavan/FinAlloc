@@ -1,11 +1,13 @@
-#include "../include/allocators/poolAllocator.hpp"
-#include <iostream>
+#include "allocators/poolAllocator.hpp"
+#include "allocators/poolConfig.hpp"
+
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <iostream>
+#include <numeric>
 #include <thread>
 #include <vector>
-#include <atomic>
-#include <numeric>
-#include <algorithm>
 
 constexpr int THREAD_COUNT = 8;
 constexpr int ALLOCATIONS_PER_THREAD = 10000;
@@ -17,123 +19,155 @@ struct BenchObj {
     ~BenchObj() { x = 0; y = 0.0; }
 };
 
-template <typename Allocator>
-void runAllocatorTest(const std::string& name) {
-    std::cout << "\nRunning test for: " << name << "\n";
+// ---------- helpers ----------
+static long long percentile(std::vector<long long>& v, int p) {
+    if (v.empty()) return 0;
+    return v[(v.size() * p) / 100];
+}
 
-    Allocator allocator(sizeof(BenchObj), THREAD_COUNT * ALLOCATIONS_PER_THREAD);
-    std::atomic<int> constructed = 0, destroyed = 0;
-    std::atomic<bool> ready = false;
-    std::vector<std::thread> threads;
-    std::vector<std::vector<long long>> allLatencies(THREAD_COUNT);
-
-    auto worker = [&](int tid) {
-        while (!ready.load(std::memory_order_acquire)) std::this_thread::yield();
-        auto& latencies = allLatencies[tid];
-
-        for (int i = 0; i < ALLOCATIONS_PER_THREAD; ++i) {
-            auto start = std::chrono::high_resolution_clock::now();
-            BenchObj* obj = allocator.template construct<BenchObj>(tid, i * 0.1);
-            auto end = std::chrono::high_resolution_clock::now();
-            latencies.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
-            allocator.destroy(obj);
-            ++constructed;
-            ++destroyed;
-        }
-    };
-
-    for (int i = 0; i < THREAD_COUNT; ++i)
-        threads.emplace_back(worker, i);
-
-    auto testStart = std::chrono::steady_clock::now();
-    ready.store(true, std::memory_order_release);
-    for (auto& t : threads) t.join();
-    auto testEnd = std::chrono::steady_clock::now();
-
+static void printStats(const char* name,
+                       const std::vector<std::vector<long long>>& allLat,
+                       std::chrono::steady_clock::time_point t0,
+                       std::chrono::steady_clock::time_point t1,
+                       int constructed, int destroyed) {
     std::vector<long long> merged;
-    for (auto& v : allLatencies) merged.insert(merged.end(), v.begin(), v.end());
+    merged.reserve(THREAD_COUNT * ALLOCATIONS_PER_THREAD);
+    for (auto& row : allLat) merged.insert(merged.end(), row.begin(), row.end());
     std::sort(merged.begin(), merged.end());
 
-    auto percentile = [&](int p) {
-        if (merged.empty()) return 0LL;
-        return merged[merged.size() * p / 100];
-    };
+    double avg = merged.empty() ? 0.0
+        : std::accumulate(merged.begin(), merged.end(), 0.0) / merged.size();
 
-    double avg = merged.empty() ? 0.0 : std::accumulate(merged.begin(), merged.end(), 0.0) / merged.size();
-
-    std::cout << "Total objects constructed: " << constructed.load() << "\n";
-    std::cout << "Total objects destroyed:   " << destroyed.load() << "\n";
+    std::cout << "\nRunning test for: " << name << "\n";
+    std::cout << "Total objects constructed: " << constructed << "\n";
+    std::cout << "Total objects destroyed:   " << destroyed << "\n";
     std::cout << "Time elapsed: "
-              << std::chrono::duration_cast<std::chrono::milliseconds>(testEnd - testStart).count()
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
               << " ms\n";
-    std::cout << "p50 latency: " << percentile(50) << " ns\n";
-    std::cout << "p95 latency: " << percentile(95) << " ns\n";
-    std::cout << "p99 latency: " << percentile(99) << " ns\n";
+    std::cout << "p50 latency: " << percentile(merged, 50) << " ns\n";
+    std::cout << "p95 latency: " << percentile(merged, 95) << " ns\n";
+    std::cout << "p99 latency: " << percentile(merged, 99) << " ns\n";
     std::cout << "avg latency: " << static_cast<long long>(avg) << " ns\n";
 }
 
-void runThreadLocalPoolTest() {
-    std::cout << "\nRunning test for: ThreadLocalPool\n";
-
-    std::atomic<int> constructed = 0, destroyed = 0;
-    std::atomic<bool> ready = false;
+// ---------- Per-thread PoolAllocator perf (each thread owns its pool) ----------
+static void runPerThreadPoolPerf() {
+    std::atomic<bool> ready{false};
+    std::atomic<int> constructed{0}, destroyed{0};
     std::vector<std::thread> threads;
     std::vector<std::vector<long long>> allLatencies(THREAD_COUNT);
 
     auto worker = [&](int tid) {
-        ThreadLocalPool allocator(sizeof(BenchObj), ALLOCATIONS_PER_THREAD);
+        // Each thread has its own single-threaded pool
+        PoolOptions opts = PoolOptions::MinimalOverhead();
+        PoolAllocator pool(sizeof(BenchObj), ALLOCATIONS_PER_THREAD, opts);
+
+        // ready barrier
         while (!ready.load(std::memory_order_acquire)) std::this_thread::yield();
-        auto& latencies = allLatencies[tid];
+
+        auto& lat = allLatencies[tid];
+        lat.reserve(ALLOCATIONS_PER_THREAD);
+
+        // (Optional) small warmup
+        for (int i = 0; i < 128; ++i) {
+            auto* o = pool.template construct<BenchObj>(tid, i * 0.1);
+            pool.destroy(o);
+        }
 
         for (int i = 0; i < ALLOCATIONS_PER_THREAD; ++i) {
-            auto start = std::chrono::high_resolution_clock::now();
-            BenchObj* obj = allocator.template construct<BenchObj>(tid, i * 0.1);
-            auto end = std::chrono::high_resolution_clock::now();
+            auto t0 = std::chrono::high_resolution_clock::now();
+            BenchObj* obj = pool.template construct<BenchObj>(tid, i * 0.1);
+            auto t1 = std::chrono::high_resolution_clock::now();
 
             if (!obj) {
-                std::cerr << "[TEST ERROR] allocator returned nullptr at i=" << i << " (thread " << tid << ")\n";
+                std::cerr << "[PerThreadPool] nullptr alloc at i=" << i
+                          << " (thread " << tid << ")\n";
                 std::abort();
             }
 
-            latencies.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
-            allocator.destroy(obj);
+            lat.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+            pool.destroy(obj);
             ++constructed;
             ++destroyed;
         }
     };
 
-    for (int i = 0; i < THREAD_COUNT; ++i)
-        threads.emplace_back(worker, i);
+    for (int i = 0; i < THREAD_COUNT; ++i) threads.emplace_back(worker, i);
 
-    auto testStart = std::chrono::steady_clock::now();
+    auto t0 = std::chrono::steady_clock::now();
     ready.store(true, std::memory_order_release);
-    for (auto& t : threads) t.join();
-    auto testEnd = std::chrono::steady_clock::now();
+    for (auto& th : threads) th.join();
+    auto t1 = std::chrono::steady_clock::now();
 
-    std::vector<long long> merged;
-    for (auto& v : allLatencies) merged.insert(merged.end(), v.begin(), v.end());
-    std::sort(merged.begin(), merged.end());
+    printStats("Per-thread PoolAllocator", allLatencies, t0, t1,
+               constructed.load(), destroyed.load());
+}
 
-    auto percentile = [&](int p) {
-        if (merged.empty()) return 0LL;
-        return merged[merged.size() * p / 100];
+// ---------- LockFreePoolAllocator perf (shared instance) ----------
+static void runLockFreePerf() {
+    // Use MinimalOverhead to keep latency numbers clean
+    PoolOptions opts = PoolOptions::MinimalOverhead();
+    // capacity large enough for total outstanding allocations
+    const std::size_t capacity = static_cast<std::size_t>(THREAD_COUNT) * ALLOCATIONS_PER_THREAD;
+
+    LockFreePoolAllocator pool(sizeof(BenchObj), capacity, opts);
+
+    std::atomic<bool> ready{false};
+    std::atomic<int> constructed{0}, destroyed{0};
+    std::vector<std::thread> threads;
+    std::vector<std::vector<long long>> allLatencies(THREAD_COUNT);
+
+    auto worker = [&](int tid) {
+        while (!ready.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        auto& lat = allLatencies[tid];
+        lat.reserve(ALLOCATIONS_PER_THREAD);
+
+        // small warmup
+        for (int i = 0; i < 128; ++i) {
+            auto* o = pool.template construct<BenchObj>(tid, i * 0.1);
+            pool.destroy(o);
+        }
+
+        for (int i = 0; i < ALLOCATIONS_PER_THREAD; ++i) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            BenchObj* obj = pool.template construct<BenchObj>(tid, i * 0.1);
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            if (!obj) {
+                std::cerr << "[LockFree] nullptr alloc at i=" << i
+                          << " (thread " << tid << ")\n";
+                std::abort();
+            }
+
+            lat.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+            pool.destroy(obj);
+            ++constructed;
+            ++destroyed;
+        }
     };
 
-    double avg = merged.empty() ? 0.0 : std::accumulate(merged.begin(), merged.end(), 0.0) / merged.size();
+    for (int i = 0; i < THREAD_COUNT; ++i) threads.emplace_back(worker, i);
 
-    std::cout << "Total objects constructed: " << constructed.load() << "\n";
-    std::cout << "Total objects destroyed:   " << destroyed.load() << "\n";
-    std::cout << "Time elapsed: "
-              << std::chrono::duration_cast<std::chrono::milliseconds>(testEnd - testStart).count()
-              << " ms\n";
-    std::cout << "p50 latency: " << percentile(50) << " ns\n";
-    std::cout << "p95 latency: " << percentile(95) << " ns\n";
-    std::cout << "p99 latency: " << percentile(99) << " ns\n";
-    std::cout << "avg latency: " << static_cast<long long>(avg) << " ns\n";
+    auto t0 = std::chrono::steady_clock::now();
+    ready.store(true, std::memory_order_release);
+    for (auto& t : threads) t.join();
+    auto t1 = std::chrono::steady_clock::now();
+
+    printStats("LockFreePoolAllocator", allLatencies, t0, t1,
+               constructed.load(), destroyed.load());
+
+    // (Optional) print quick stats snapshot
+    PoolStats s = pool.getStats();
+    std::cout << "alloc_calls=" << s.alloc_calls
+              << " free_calls=" << s.free_calls
+              << " high_watermark=" << s.high_watermark
+              << " cas_failures=" << s.cas_failures
+              << " alloc_failures=" << s.alloc_failures << "\n";
 }
 
 int main() {
-    runThreadLocalPoolTest();
-    runAllocatorTest<LockFreePoolAllocator>("LockFreePoolAllocator");
+    runPerThreadPoolPerf();
+    runLockFreePerf();
     return 0;
 }
