@@ -4,7 +4,8 @@
 #include <cstddef>
 #include <map>
 #include <memory>
-#include <cmath>
+#include <limits>
+#include <stdexcept>
 #include "poolAllocator.hpp"
 
 template <typename AllocatorType = PoolAllocator>
@@ -12,7 +13,12 @@ class SizeClassPool
 {
 public:
     explicit SizeClassPool(size_t maxSize = 1024, size_t objectsPerClass = 1024)
-        : maxObjectSize(maxSize), objectsPerBucket(objectsPerClass) {}
+        : maxObjectSize(maxSize), objectsPerBucket(objectsPerClass)
+    {
+        if (!maxSize || maxSize > (std::size_t{1} << (std::numeric_limits<std::size_t>::digits - 1)) ||
+            !objectsPerClass || objectsPerClass >= UINT32_MAX)
+            throw std::invalid_argument("invalid size class configuration");
+    }
 
     void *allocate(size_t size)
     {
@@ -42,7 +48,14 @@ public:
     T *construct(Args &&...args)
     {
         void *mem = allocate(sizeof(T));
-        return mem ? new (mem) T(std::forward<Args>(args)...) : nullptr;
+        if (alignof(T) > alignof(std::max_align_t))
+        {
+            deallocate(mem, sizeof(T));
+            throw std::bad_alloc();
+        }
+        if (!mem) return nullptr;
+        try { return new (mem) T(std::forward<Args>(args)...); }
+        catch (...) { deallocate(mem, sizeof(T)); throw; }
     }
 
     template <typename T>

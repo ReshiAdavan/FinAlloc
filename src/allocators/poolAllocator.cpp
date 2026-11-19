@@ -1,13 +1,20 @@
 #include "allocators/poolAllocator.hpp"
 #include <iostream>
+#include <limits>
 
 PoolAllocator::PoolAllocator(std::size_t objectSize, std::size_t capacity,
                              PoolOptions options)
     : poolCapacity(capacity), options_(options)
 {
+    if (capacity == 0 || capacity >= UINT32_MAX)
+        throw std::invalid_argument("pool capacity must be in [1, UINT32_MAX)");
+    if (objectSize > std::numeric_limits<std::size_t>::max() - alignof(std::max_align_t))
+        throw std::bad_alloc();
     if (objectSize < sizeof(void *))
         objectSize = sizeof(void *);
     alignedObjSize = alignUp(objectSize, alignof(std::max_align_t));
+    if (alignedObjSize > static_cast<std::size_t>(std::numeric_limits<std::ptrdiff_t>::max()) / poolCapacity)
+        throw std::bad_alloc();
     const std::size_t totalSize = alignedObjSize * poolCapacity;
 
     memoryBlock = std::malloc(totalSize);
@@ -208,16 +215,15 @@ PoolStats PoolAllocator::getStats() const
 LockFreePoolAllocator::LockFreePoolAllocator(std::size_t objectSize, std::size_t capacity,
                                              PoolOptions options)
     : PoolAllocator(objectSize, capacity, options),
-      freeListHead(nonAtomicFreeListHead)
+      freeListHead(0)
 {
     // Build side-array links
-    next_.resize(poolCapacity, nullptr);
-    char *base = static_cast<char *>(memoryBlock);
+    next_ = std::make_unique<std::atomic<std::uint32_t>[]>(poolCapacity);
     for (std::size_t i = 0; i + 1 < poolCapacity; ++i)
     {
-        next_[i] = base + (i + 1) * alignedObjSize;
+        next_[i].store(static_cast<std::uint32_t>(i + 1), std::memory_order_relaxed);
     }
-    next_[poolCapacity - 1] = nullptr;
+    next_[poolCapacity - 1].store(empty_, std::memory_order_relaxed);
 
     if (options_.quarantine_size > 0)
     {
@@ -227,31 +233,33 @@ LockFreePoolAllocator::LockFreePoolAllocator(std::size_t objectSize, std::size_t
 
 LockFreePoolAllocator::~LockFreePoolAllocator()
 {
-    freeListHead.store(nullptr, std::memory_order_relaxed);
+    freeListHead.store(empty_, std::memory_order_relaxed);
 }
 
 void *LockFreePoolAllocator::allocate()
 {
     metrics_.alloc_calls.fetch_add(1, std::memory_order_relaxed);
-    void *head = freeListHead.load(std::memory_order_acquire);
+    auto head = freeListHead.load(std::memory_order_acquire);
 
     while (true)
     {
-        if (!head)
+        const auto index = static_cast<std::uint32_t>(head);
+        if (index == empty_)
         {
             metrics_.alloc_failures.fetch_add(1, std::memory_order_relaxed);
             return nullptr;
         }
-        if (!inRange_(head))
+        void *block = static_cast<char *>(memoryBlock) + index * alignedObjSize;
+        if (!inRange_(block))
         {
-            std::cerr << "[ERROR] Invalid head pointer in allocate(): " << head << "\n";
+            std::cerr << "[ERROR] Invalid head pointer in allocate(): " << block << "\n";
             std::abort();
         }
 
         // Read next from side array (not from user memory)
-        void *next = next_[indexOf_(head)];
+        auto next = next_[index].load(std::memory_order_relaxed);
 
-        if (freeListHead.compare_exchange_weak(head, next,
+        if (freeListHead.compare_exchange_weak(head, tagged_(head, next),
                                                std::memory_order_acq_rel,
                                                std::memory_order_acquire))
         {
@@ -266,17 +274,17 @@ void *LockFreePoolAllocator::allocate()
 
             if (options_.verify_poison_on_alloc && options_.poison_on_free)
             {
-                verifyPoison_(head);
+                verifyPoison_(block);
             }
             if (options_.zero_on_alloc)
             {
-                std::memset(head, 0, alignedObjSize);
+                std::memset(block, 0, alignedObjSize);
             }
             if (options_.on_alloc)
-                options_.on_alloc(head, alignedObjSize);
+                options_.on_alloc(block, alignedObjSize);
             if (occupancyHist_)
                 sampleOccupancy_();
-            return head;
+            return block;
         }
         else
         {
@@ -289,11 +297,11 @@ void LockFreePoolAllocator::lfFreeListPush_(void *ptr)
 {
     // CAS-based push using side-array link
     const std::size_t idx = indexOf_(ptr);
-    void *head = freeListHead.load(std::memory_order_relaxed);
+    auto head = freeListHead.load(std::memory_order_relaxed);
     do
     {
-        next_[idx] = head; // publish link before releasing CAS
-    } while (!freeListHead.compare_exchange_weak(head, ptr,
+        next_[idx].store(static_cast<std::uint32_t>(head), std::memory_order_relaxed); // publish link before releasing CAS
+    } while (!freeListHead.compare_exchange_weak(head, tagged_(head, static_cast<std::uint32_t>(idx)),
                                                  std::memory_order_release, std::memory_order_relaxed));
 }
 
@@ -312,6 +320,11 @@ void LockFreePoolAllocator::deallocate(void *ptr)
     if (options_.poison_on_free)
         applyPoison_(ptr);
 
+    usedCount.fetch_sub(1, std::memory_order_relaxed);
+
+    metrics_.free_calls.fetch_add(1, std::memory_order_relaxed);
+    metrics_.in_use.fetch_sub(1, std::memory_order_relaxed);
+
     if (options_.quarantine_size > 0)
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -328,10 +341,6 @@ void LockFreePoolAllocator::deallocate(void *ptr)
         lfFreeListPush_(ptr);
     }
 
-    usedCount.fetch_sub(1, std::memory_order_relaxed);
-
-    metrics_.free_calls.fetch_add(1, std::memory_order_relaxed);
-    metrics_.in_use.fetch_sub(1, std::memory_order_relaxed);
     if (occupancyHist_)
         sampleOccupancy_();
 }
