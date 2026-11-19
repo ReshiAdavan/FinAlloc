@@ -366,14 +366,14 @@ int main(int argc, char **argv)
         if (o.format == "json")
             std::cout << "{\"schema\":1,\"status\":\"ok\",\"allocator\":" << quote(o.allocator)
                 << ",\"profile\":" << quote(FA_PROFILE) << ",\"instrumented\":" << (instrumented() ? "true" : "false")
-                << ",\"commit\":" << quote(FA_COMMIT) << ",\"dirty\":" << FA_DIRTY << ",\"compiler\":" << quote(__VERSION__)
+                << ",\"source_digest\":" << quote(FA_SOURCE_DIGEST) << ",\"commit\":" << quote(FA_COMMIT) << ",\"dirty\":" << FA_DIRTY << ",\"compiler\":" << quote(__VERSION__)
                 << ",\"compiler_command\":" << quote(FA_COMPILER_COMMAND) << ",\"flags\":" << quote(FA_FLAGS)
                 << ",\"cpu\":" << quote(FA_CPU) << ",\"os\":" << quote(FA_OS) << ",\"mode\":" << quote(o.mode)
                 << ",\"free\":" << quote(o.freeing) << ",\"lifetime\":" << quote((o.allocator == "arena" || o.allocator == "numa" || o.allocator == "pmr-arena") ? "epoch-reset" : "individual-free")
                 << ",\"threads\":" << o.threads << ",\"iters\":" << o.iters << ",\"live_per_thread\":" << o.live
                 << ",\"size\":" << o.size << ",\"alignment\":" << o.alignment << ",\"seed\":" << o.seed
                 << ",\"warmup\":" << o.warmup << ",\"sample_every\":" << o.sampleEvery << ",\"runs\":[";
-        else std::cout << "allocator,profile,instrumented,commit,dirty,compiler,flags,cpu,os,mode,free,threads,iters,live,size,alignment,seed,warmup,sample_every,repetition,setup_warmup_ns,seconds,operations,checksum,failures,reserved_payload_or_upstream_peak_bytes,alloc_p50_ns,alloc_p95_ns,alloc_p99_ns,free_p50_ns,free_p99_ns,pair_p50_ns,reset_p50_ns\n";
+        else std::cout << "allocator,profile,instrumented,commit,source_digest,dirty,compiler,flags,cpu,os,mode,free,threads,iters,live,size,alignment,seed,warmup,sample_every,repetition,setup_warmup_ns,seconds,operations,checksum,failures,reserved_payload_or_upstream_peak_bytes,alloc_p50_ns,alloc_p95_ns,alloc_p99_ns,free_p50_ns,free_p99_ns,pair_p50_ns,reset_p50_ns\n";
         std::vector<double> rates;
         for (std::size_t rep = 0; rep < o.repetitions; ++rep)
         {
@@ -398,7 +398,7 @@ int main(int argc, char **argv)
                 std::cout << '}';
             }
             else std::cout << csv(o.allocator) << ',' << csv(FA_PROFILE) << ',' << instrumented() << ',' << csv(FA_COMMIT)
-                << ',' << FA_DIRTY << ',' << csv(__VERSION__) << ',' << csv(FA_FLAGS) << ',' << csv(FA_CPU) << ',' << csv(FA_OS)
+                << ',' << csv(FA_SOURCE_DIGEST) << ',' << FA_DIRTY << ',' << csv(__VERSION__) << ',' << csv(FA_FLAGS) << ',' << csv(FA_CPU) << ',' << csv(FA_OS)
                 << ',' << csv(o.mode) << ',' << csv(o.freeing) << ',' << o.threads << ',' << o.iters << ',' << o.live << ',' << o.size
                 << ',' << o.alignment << ',' << o.seed << ',' << o.warmup << ',' << o.sampleEvery << ',' << rep << ',' << r.setup << ',' << r.seconds
                 << ',' << r.operations << ',' << r.checksum << ',' << r.failures << ',' << r.reserved << ',' << quantile(r.allocation,.50)

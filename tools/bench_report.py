@@ -40,7 +40,7 @@ for file in sorted(a.output.glob('*.json')):
         continue
     if r['profile'] != 'release' or r['instrumented'] or r['mode'] not in ('throughput', 'latency'):
         raise SystemExit(f'Refusing non-release, instrumented, or verification result: {file}')
-    provenance.add((r['commit'], r['dirty'], r['compiler'], r['flags'], r['cpu'], r['os']))
+    provenance.add((r['commit'], r['source_digest'], r['dirty'], r['compiler'], r['flags'], r['cpu'], r['os']))
     rates = [v['throughput_ops_s'] for v in r['runs']]
     tails = [v['allocate_ns']['p99'] for v in r['runs'] if v['allocate_ns']]
     tail = f'{statistics.median(tails):.1f}' if tails else '—'
@@ -63,8 +63,8 @@ not subtracted. No threshold is enforced on shared CI.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 '''
 text = header + '\n'.join(rows) + '\n\n## Provenance\n\n'
-for commit, dirty, compiler, flags, cpu, os_name in provenance:
-    text += f'- Commit: `{commit}`; dirty tree: `{dirty}`\n- Compiler: {compiler}\n- Flags: `{flags}`\n- CPU: {cpu}\n- OS: {os_name}\n'
+for commit, source_digest, dirty, compiler, flags, cpu, os_name in provenance:
+    text += f'- Commit: `{commit}`; source digest: `{source_digest}`; dirty tree: `{dirty}`\n- Compiler: {compiler}\n- Flags: `{flags}`\n- CPU: {cpu}\n- OS: {os_name}\n'
 text += '\nRaw JSON files beside this report include checksums, sample counts, allocation failures, setup/warmup times, and reserved-memory estimates.\n'
 (a.output / 'report.md').write_text(text)
 print(a.output / 'report.md')

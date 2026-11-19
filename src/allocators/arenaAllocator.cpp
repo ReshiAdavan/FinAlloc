@@ -9,6 +9,9 @@
 #include <stdexcept>
 #include <cerrno>
 #include <system_error>
+#include "utils/allocationControl.hpp"
+using finalloc::testing::AllocationDomain;
+using finalloc::testing::checkpoint;
 #if defined(__linux__)
 #include <linux/mempolicy.h>
 #include <sys/syscall.h>
@@ -60,7 +63,7 @@ ArenaAllocator::ArenaAllocator(const ArenaOptions &opts)
         opts_.initial_chunk_size == 0 || opts_.max_chunk_size < opts_.initial_chunk_size)
         throw std::invalid_argument("invalid arena growth options");
     // start with one chunk
-    if (journalOn_) journal_.resize(1024);
+    if (journalOn_) { checkpoint(AllocationDomain::metadata); journal_.resize(1024); }
     appendChunk_(0);
 }
 
@@ -145,7 +148,7 @@ void *ArenaAllocator::allocate(std::size_t bytes, std::size_t alignment, std::so
         (opts_.use_canaries && opts_.canary_size > (limit - overhead - alignment - bytes) / 2))
         throw std::bad_alloc();
 
-    if (journalOn_ && journal_.empty()) journal_.resize(1024);
+    if (journalOn_ && journal_.empty()) { checkpoint(AllocationDomain::metadata); journal_.resize(1024); }
     void *out = nullptr;
     for (; activeChunk_ < chunks_.size(); ++activeChunk_)
         if (tryAllocFromChunk_(chunks_[activeChunk_], bytes, alignment, &out))
@@ -275,7 +278,10 @@ bool ArenaAllocator::tryAllocFromChunk_(ArenaChunk &c, std::size_t userSize, std
         return false;
 
     if (opts_.use_canaries && opts_.canary_size)
+    {
+        if (canaries_.size() == canaries_.capacity()) checkpoint(AllocationDomain::metadata);
         canaries_.push_back({reinterpret_cast<unsigned char *>(userAddr), userSize});
+    }
 
     // write header
     auto *hdr = new (reinterpret_cast<void *>(hdrAddr)) BlockHeader{};
@@ -346,6 +352,7 @@ ArenaAllocator::osAllocChunk_(std::size_t usableBytes, bool guards, bool preferH
     std::vector<unsigned long> mask;
     if (numaNode >= 0)
     {
+        checkpoint(AllocationDomain::metadata);
         mask.resize(static_cast<std::size_t>(numaNode) / bits + 1, 0);
         mask[numaNode / bits] |= 1UL << (numaNode % bits);
     }
@@ -372,14 +379,18 @@ ArenaAllocator::osAllocChunk_(std::size_t usableBytes, bool guards, bool preferH
         c.size = ((c.size + granularity - 1) / granularity) * granularity;
         if (c.size > limit - granularity - 2 * page) throw std::bad_alloc();
         c.mapping_size = c.size + granularity + 2 * page;
+        checkpoint(AllocationDomain::backing);
         c.mapping_base = ::mmap(nullptr, c.mapping_size, PROT_NONE,
                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (c.mapping_base == MAP_FAILED) throw std::bad_alloc();
+        finalloc::testing::acquired();
+        c.use_mmap = true;
         const auto start = reinterpret_cast<std::uintptr_t>(c.mapping_base) + page;
         c.base = reinterpret_cast<void *>(((start + granularity - 1) / granularity) * granularity);
         if (::mprotect(c.base, c.size, PROT_READ | PROT_WRITE) != 0)
         {
             ::munmap(c.mapping_base, c.mapping_size);
+            finalloc::testing::released();
             throw std::bad_alloc();
         }
         c.use_mmap = true;
@@ -393,8 +404,10 @@ ArenaAllocator::osAllocChunk_(std::size_t usableBytes, bool guards, bool preferH
     }
     else
     {
+        checkpoint(AllocationDomain::backing);
         c.base = std::malloc(c.size);
         if (!c.base) throw std::bad_alloc();
+        finalloc::testing::acquired();
     }
     if (numaNode >= 0)
     {
@@ -418,6 +431,7 @@ ArenaAllocator::osAllocChunk_(std::size_t usableBytes, bool guards, bool preferH
 
 void ArenaAllocator::osFreeChunk_(ArenaChunk &c)
 {
+    if (c.base) finalloc::testing::released();
 #if defined(__unix__) || defined(__APPLE__)
     if (c.use_mmap) ::munmap(c.mapping_base, c.mapping_size);
     else
@@ -456,7 +470,10 @@ ArenaGroup::Chunk ArenaGroup::acquire(std::size_t minBytes, bool guards, bool pr
     std::lock_guard<std::mutex> lock(mtx_);
     const std::size_t idx = pick_index(minBytes);
     if (idx >= bins_.size())
+    {
+        checkpoint(AllocationDomain::metadata);
         bins_.resize(BIN_COUNT);
+    }
 
     for (std::size_t i = idx; i < bins_.size(); ++i)
     {
@@ -479,15 +496,18 @@ void ArenaGroup::release(Chunk &&chunk) noexcept
 {
     try
     {
-    if (!chunk.base || chunk.size == 0)
-        return;
-    std::lock_guard<std::mutex> lock(mtx_);
-    const std::size_t idx = pick_index(chunk.size);
-    if (idx >= bins_.size())
-        bins_.resize(BIN_COUNT);
-    chunk.offset = 0;
-    bins_[idx].slabs.push_back(chunk);
-    chunk = {};
+        if (!chunk.base || chunk.size == 0) return;
+        std::lock_guard<std::mutex> lock(mtx_);
+        const std::size_t idx = pick_index(chunk.size);
+        if (idx >= bins_.size())
+        {
+            checkpoint(AllocationDomain::metadata);
+            bins_.resize(BIN_COUNT);
+        }
+        chunk.offset = 0;
+        if (bins_[idx].slabs.size() == bins_[idx].slabs.capacity()) checkpoint(AllocationDomain::metadata);
+        bins_[idx].slabs.push_back(chunk);
+        chunk = {};
     }
     catch (...) { ArenaAllocator::osFreeChunk_(chunk); }
 }
@@ -517,7 +537,11 @@ ArenaAllocator::MemoryStats ArenaAllocator::memoryStats() const
 void ArenaAllocator::appendChunk_(std::size_t minBytes)
 {
     auto chunk = newChunk_(minBytes);
-    try { chunks_.push_back(chunk); }
+    try
+    {
+        if (chunks_.size() == chunks_.capacity()) checkpoint(AllocationDomain::metadata);
+        chunks_.push_back(chunk);
+    }
     catch (...) { osFreeChunk_(chunk); throw; }
 }
 

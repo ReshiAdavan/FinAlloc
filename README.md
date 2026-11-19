@@ -163,3 +163,11 @@ repetitions, sampled operation latency, and a separate ownership-verification
 mode. Generate a comparison with `python3 tools/bench_report.py`.
 See [benchmark methodology](docs/benchmarking.md) for exact measurement boundaries,
 platform skips, memory accounting, and optional mimalloc support.
+
+# randomized correctness and failure recovery
+
+`make PROFILE=asan test` includes deterministic allocation-sequence and failure-
+injection tests. Use `make stress STRESS_CASES=10000` for longer seeded campaigns,
+`make fuzz-smoke` with a libFuzzer-enabled Clang for coverage-guided testing, and
+`make tsan` for separate concurrency checks. See [fuzzing and replay](docs/fuzzing.md)
+for seeds, minimized-input replay, injected failure sites, and platform support.

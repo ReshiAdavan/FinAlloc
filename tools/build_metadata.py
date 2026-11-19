@@ -1,6 +1,7 @@
 """Write build provenance; preserve mtime if the configuration is unchanged."""
 import argparse
 import json
+import hashlib
 from pathlib import Path
 import platform
 import subprocess
@@ -24,7 +25,15 @@ elif Path('/proc/cpuinfo').exists():
         if line.startswith('model name'):
             cpu = line.split(':', 1)[1].strip()
             break
-values = {'PROFILE': a.profile, 'FLAGS': a.flags, 'COMPILER_COMMAND': a.compiler,
+digest = hashlib.sha256()
+paths = subprocess.check_output(['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z']).split(b'\0')
+for raw in sorted(set(paths)):
+    if not raw:
+        continue
+    file = Path(raw.decode())
+    if file.is_file():
+        digest.update(raw + b'\0' + file.read_bytes() + b'\0')
+values = {'SOURCE_DIGEST': digest.hexdigest(), 'PROFILE': a.profile, 'FLAGS': a.flags, 'COMPILER_COMMAND': a.compiler,
           'COMMIT': command(['git', 'rev-parse', 'HEAD']),
           'DIRTY': str(bool(command(['git', 'status', '--porcelain', '--untracked-files=normal']))).lower(),
           'CPU': cpu, 'OS': platform.platform()}
