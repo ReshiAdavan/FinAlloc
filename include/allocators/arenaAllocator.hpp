@@ -37,6 +37,8 @@ public:
         std::size_t offset = 0;
         bool use_mmap = false;
         bool guard_pages = false;
+        bool prefer_huge = false;
+        bool huge_page_advised = false; // advice accepted, not a physical residency guarantee
         void *mapping_base = nullptr;
         std::size_t mapping_size = 0;
         std::size_t usableSize() const { return size; }

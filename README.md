@@ -38,7 +38,7 @@ custom memory allocator for quant infra
 - [x] Thread-local Sub-Arenas [Arena-per-thread to avoid false sharing, tuned for CPU core affinity]
 - [x] Arena Group Manager [Shared chunk pool to reuse arenas between sessions (recycle slabs)]
 - [x] Journaling or Allocation Tracing Mode [For debugging perf regressions, e.g., log large allocations with source info]
-- [ ] HugePage Support (Linux) [Backed by mmap with MAP_HUGETLB or madvise for better TLB performance]
+- [x] HugePage Support (Linux) [Backed by mmap with MAP_HUGETLB or madvise for better TLB performance]
 
 2. pool allocator
 
@@ -70,3 +70,15 @@ ArenaGroup must outlive attached arenas; it releases cached slabs on destruction
 Arenas are single-threaded; use one per thread or external synchronization.
 `construct<T>` does not register destructors; explicitly destroy nontrivial objects
 before reset/release. Requests larger than max_chunk_size use dedicated chunks.
+
+# Linux huge-page preference
+
+Set `prefer_huge=true` to use a dedicated anonymous mapping, aligned and sized
+in 2 MiB units, with `madvise(MADV_HUGEPAGE)`. This is transparent huge-page
+**advice**, not a guarantee that huge pages are resident. Failed advice leaves a
+usable ordinary mapping. On non-Linux systems the preference falls back to
+ordinary allocation. `ArenaChunk::huge_page_advised` reports whether Linux
+accepted advice; `prefer_huge` records the request for compatible slab reuse.
+It can be combined with guard pages. Small arenas may waste up to a few MiB;
+use this option for large working sets. No reserved hugetlb pool is required.
+See [Linux THP documentation](https://docs.kernel.org/admin-guide/mm/transhuge.html).
