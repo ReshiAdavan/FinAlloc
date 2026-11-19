@@ -4,6 +4,13 @@
 #include <cstring>
 #include <algorithm>
 #include <iostream>
+#include <limits>
+#include <cmath>
+#include <stdexcept>
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace
 {
@@ -41,6 +48,9 @@ ArenaAllocator::ArenaAllocator(const ArenaOptions &opts)
       journal_(),
       journalHead_(0)
 {
+    if (!std::isfinite(opts_.growth_factor) || opts_.growth_factor < 1.0 ||
+        opts_.initial_chunk_size == 0 || opts_.max_chunk_size < opts_.initial_chunk_size)
+        throw std::invalid_argument("invalid arena growth options");
     // start with one chunk
     ArenaChunk first = newChunk_(0);
     chunks_.push_back(std::move(first));
@@ -67,6 +77,8 @@ ArenaAllocator::ArenaAllocator(ArenaAllocator &&o) noexcept
       journal_(std::move(o.journal_)),
       journalHead_(o.journalHead_)
 {
+    canaries_ = std::move(o.canaries_);
+    o.canaries_.clear();
     o.nextChunkBytes_ = 0;
     o.totalBytes_ = 0;
     o.group_ = nullptr;
@@ -86,6 +98,8 @@ ArenaAllocator &ArenaAllocator::operator=(ArenaAllocator &&o) noexcept
     journalOn_ = o.journalOn_;
     journal_ = std::move(o.journal_);
     journalHead_ = o.journalHead_;
+    canaries_ = std::move(o.canaries_);
+    o.canaries_.clear();
     o.nextChunkBytes_ = 0;
     o.totalBytes_ = 0;
     o.group_ = nullptr;
@@ -103,7 +117,17 @@ void *ArenaAllocator::allocate(std::size_t bytes, std::size_t alignment)
     if (alignment < kMinAlign)
         alignment = kMinAlign;
     if ((alignment & (alignment - 1)) != 0)
+    {
+        if (alignment > (std::numeric_limits<std::size_t>::max() >> 1))
+            throw std::bad_alloc();
         alignment = next_pow2(alignment);
+    }
+    const auto limit = std::numeric_limits<std::size_t>::max();
+    const auto overhead = sizeof(BlockHeader) + alignof(std::max_align_t);
+    if (bytes > static_cast<std::size_t>(std::numeric_limits<std::ptrdiff_t>::max()) ||
+        alignment > limit - overhead || bytes > limit - overhead - alignment ||
+        (opts_.use_canaries && opts_.canary_size > (limit - overhead - alignment - bytes) / 2))
+        throw std::bad_alloc();
 
     // try current chunk
     void *out = nullptr;
@@ -117,8 +141,19 @@ void *ArenaAllocator::allocate(std::size_t bytes, std::size_t alignment)
     return allocateSlow_(bytes, alignment);
 }
 
+void ArenaAllocator::validate() const
+{
+    for (const auto &r : canaries_)
+        for (std::size_t i = 0; i < opts_.canary_size; ++i)
+            if (r.user[-static_cast<std::ptrdiff_t>(i) - 1] != opts_.canary_byte ||
+                r.user[r.size + i] != opts_.canary_byte)
+                throw std::runtime_error("arena canary corruption");
+}
+
 void ArenaAllocator::reset()
 {
+    validate();
+    canaries_.clear();
     for (auto &c : chunks_)
         c.offset = 0;
     totalBytes_ = 0;
@@ -127,6 +162,8 @@ void ArenaAllocator::reset()
 
 void ArenaAllocator::release()
 {
+    // Release must always reclaim storage, even after a failed validation.
+    canaries_.clear();
     // return slabs to group or OS
     if (group_)
     {
@@ -163,14 +200,15 @@ void *ArenaAllocator::allocateSlow_(std::size_t size, std::size_t alignment)
 
     // choose next chunk size: geometric growth bounded, at least 'worst'
     std::size_t want = std::max(nextChunkBytes_, worst);
-    want = std::clamp(want, std::max(opts_.initial_chunk_size, worst), opts_.max_chunk_size);
+    want = std::max(worst, std::min(want, opts_.max_chunk_size));
 
     // acquire new chunk
     chunks_.push_back(newChunk_(want));
 
     // advance growth for next time
     const double g = (opts_.growth_factor > 1.0) ? opts_.growth_factor : 2.0;
-    std::size_t next = static_cast<std::size_t>(static_cast<double>(want) * g);
+    const long double grown = static_cast<long double>(want) * g;
+    std::size_t next = grown >= opts_.max_chunk_size ? opts_.max_chunk_size : static_cast<std::size_t>(grown);
     if (next < worst)
         next = worst;
     if (next < opts_.initial_chunk_size)
@@ -213,8 +251,11 @@ bool ArenaAllocator::tryAllocFromChunk_(ArenaChunk &c, std::size_t userSize, std
     const std::uintptr_t userAddr = align_up(hdrEnd + pre, alignment);
     const std::uintptr_t end = userAddr + userSize + post;
 
-    if (end > base + c.size)
+    if (userAddr < hdrEnd || end < userAddr || end > base + c.size)
         return false;
+
+    if (opts_.use_canaries && opts_.canary_size)
+        canaries_.push_back({reinterpret_cast<unsigned char *>(userAddr), userSize});
 
     // write header
     auto *hdr = reinterpret_cast<BlockHeader *>(hdrAddr);
@@ -244,7 +285,6 @@ ArenaAllocator::ArenaChunk ArenaAllocator::newChunk_(std::size_t minBytes)
     // group_ may be null (no recycler)
     if (group_)
     {
-        // guard/huge flags are harmless no-ops in this portable osAlloc
         return group_->acquire(want, opts_.guard_pages, opts_.prefer_huge);
     }
     return osAllocChunk_(want, opts_.guard_pages, opts_.prefer_huge);
@@ -280,30 +320,53 @@ void ArenaAllocator::maybeJournal_(std::size_t size, std::size_t alignment)
     journalHead_ = (journalHead_ + 1) % journal_.size();
 }
 
-// ---- public static: portable OS chunk alloc/free ----
+// ---- OS chunk allocation ----
 ArenaAllocator::ArenaChunk
-ArenaAllocator::osAllocChunk_(std::size_t usableBytes, bool /*guards*/, bool /*preferHuge*/)
+ArenaAllocator::osAllocChunk_(std::size_t usableBytes, bool guards, bool /*preferHuge*/)
 {
     ArenaChunk c;
-    c.size = std::max<std::size_t>(usableBytes, std::size_t{4096});
-    c.base = std::malloc(c.size);
-    if (!c.base)
-        throw std::bad_alloc();
-    c.offset = 0;
-    c.use_mmap = false;
-    c.guard_pages = false;
+    c.size = std::max<std::size_t>(usableBytes, 4096);
+    if (guards)
+    {
+#if defined(__unix__) || defined(__APPLE__)
+        const long rawPage = ::sysconf(_SC_PAGESIZE);
+        if (rawPage <= 0) throw std::bad_alloc();
+        const auto page = static_cast<std::size_t>(rawPage);
+        const auto limit = std::numeric_limits<std::size_t>::max();
+        if (c.size > limit - 3 * page) throw std::bad_alloc();
+        c.size = ((c.size + page - 1) / page) * page;
+        c.mapping_size = c.size + 2 * page;
+        c.mapping_base = ::mmap(nullptr, c.mapping_size, PROT_NONE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (c.mapping_base == MAP_FAILED) throw std::bad_alloc();
+        c.base = static_cast<char *>(c.mapping_base) + page;
+        if (::mprotect(c.base, c.size, PROT_READ | PROT_WRITE) != 0)
+        {
+            ::munmap(c.mapping_base, c.mapping_size);
+            throw std::bad_alloc();
+        }
+        c.use_mmap = true;
+        c.guard_pages = true;
+#else
+        throw std::runtime_error("guard pages require POSIX mmap");
+#endif
+    }
+    else
+    {
+        c.base = std::malloc(c.size);
+        if (!c.base) throw std::bad_alloc();
+    }
     return c;
 }
 
-void ArenaAllocator::osFreeChunk_(ArenaAllocator::ArenaChunk &c)
+void ArenaAllocator::osFreeChunk_(ArenaChunk &c)
 {
-    if (c.base)
+#if defined(__unix__) || defined(__APPLE__)
+    if (c.use_mmap) ::munmap(c.mapping_base, c.mapping_size);
+    else
+#endif
         std::free(c.base);
-    c.base = nullptr;
-    c.size = 0;
-    c.offset = 0;
-    c.use_mmap = false;
-    c.guard_pages = false;
+    c = {};
 }
 
 namespace
@@ -338,13 +401,17 @@ ArenaGroup::Chunk ArenaGroup::acquire(std::size_t minBytes, bool guards, bool pr
     if (idx >= bins_.size())
         bins_.resize(BIN_COUNT);
 
-    auto &vec = bins_[idx].slabs;
-    if (!vec.empty())
+    for (std::size_t i = idx; i < bins_.size(); ++i)
     {
-        Chunk c = std::move(vec.back());
-        vec.pop_back();
-        c.offset = 0;
-        return c;
+        auto &vec = bins_[i].slabs;
+        for (auto it = vec.begin(); it != vec.end(); ++it)
+            if (it->size >= minBytes && it->guard_pages == guards)
+            {
+                Chunk c = *it;
+                vec.erase(it);
+                c.offset = 0;
+                return c;
+            }
     }
     const std::size_t want = std::max(minBytes, class_bytes(idx));
     return ArenaAllocator::osAllocChunk_(want, guards, preferHuge);
@@ -359,5 +426,13 @@ void ArenaGroup::release(Chunk &&chunk)
     if (idx >= bins_.size())
         bins_.resize(BIN_COUNT);
     chunk.offset = 0;
-    bins_[idx].slabs.emplace_back(std::move(chunk));
+    bins_[idx].slabs.push_back(chunk);
+    chunk = {};
+}
+
+ArenaGroup::~ArenaGroup()
+{
+    for (auto &bin : bins_)
+        for (auto &chunk : bin.slabs)
+            ArenaAllocator::osFreeChunk_(chunk);
 }

@@ -37,6 +37,8 @@ public:
         std::size_t offset = 0;
         bool use_mmap = false;
         bool guard_pages = false;
+        void *mapping_base = nullptr;
+        std::size_t mapping_size = 0;
         std::size_t usableSize() const { return size; }
     };
 
@@ -58,6 +60,7 @@ public:
     }
     template <typename T>
     void destroy(T * /*ptr*/) {}
+    void validate() const; // throws std::runtime_error on red-zone corruption
     void reset();
     void release();
 
@@ -65,7 +68,7 @@ public:
     std::size_t bytesRemaining() const;
     const ArenaOptions &options() const { return opts_; }
 
-    static ArenaChunk osAllocChunk_(std::size_t usableBytes, bool /*guards*/, bool /*preferHuge*/);
+    static ArenaChunk osAllocChunk_(std::size_t usableBytes, bool guards, bool preferHuge);
     static void osFreeChunk_(ArenaChunk &c);
 
     void attachGroup(ArenaGroup *g) { group_ = g; }
@@ -100,6 +103,13 @@ private:
     // canaries
     void writeCanaries_(unsigned char *user, std::size_t size, std::size_t pre, std::size_t post);
     void maybeJournal_(std::size_t size, std::size_t alignment);
+
+    struct CanaryRecord
+    {
+        unsigned char *user;
+        std::size_t size;
+    };
+    std::vector<CanaryRecord> canaries_;
 
     // state
     ArenaOptions opts_{};
@@ -148,6 +158,7 @@ class ArenaGroup
 public:
     using Chunk = ArenaAllocator::ArenaChunk;
 
+    ~ArenaGroup();
     Chunk acquire(std::size_t minBytes, bool guards, bool preferHuge);
     void release(Chunk &&chunk);
 

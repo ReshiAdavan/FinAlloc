@@ -71,7 +71,9 @@ $(TARGET): $(OBJS) | $(BIN_DIR)
 # -------------------------------------------------------------------
 # Phony helpers
 # -------------------------------------------------------------------
-.PHONY: tests bench clean
+.PHONY: test tests bench clean
+
+test: tests
 
 # Build & run all tests except the benchmark
 tests: $(RUN_TEST_BINS)
