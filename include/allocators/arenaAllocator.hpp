@@ -7,6 +7,7 @@
 #include <mutex>
 #include <utility>
 #include <new>
+#include <source_location>
 
 struct ArenaOptions
 {
@@ -58,7 +59,15 @@ public:
     ArenaAllocator(const ArenaAllocator &) = delete;
     ArenaAllocator &operator=(const ArenaAllocator &) = delete;
 
-    void *allocate(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t));
+    void *allocate(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t),
+                   std::source_location source = std::source_location::current());
+    struct JournalEntry
+    {
+        std::size_t size;
+        std::size_t alignment;
+        std::source_location source;
+    };
+    std::vector<JournalEntry> journalSnapshot() const;
 
     template <typename T, typename... Args>
     T *construct(Args &&...args)
@@ -67,10 +76,10 @@ public:
         return p ? new (p) T(std::forward<Args>(args)...) : nullptr;
     }
     template <typename T>
-    void destroy(T * /*ptr*/) {}
+    void destroy(T *ptr) { if (ptr) ptr->~T(); }
     void validate() const; // throws std::runtime_error on red-zone corruption
     void reset();
-    void release();
+    void release() noexcept;
 
     std::size_t chunkCount() const { return chunks_.size(); }
     std::size_t bytesRemaining() const;
@@ -98,25 +107,19 @@ private:
         std::size_t post_canary = 0;
     };
 
-    struct JournalEntry
-    {
-        std::size_t size;
-        std::size_t alignment;
-        std::uintptr_t retaddr;
-    };
-
     // helpers
-    void *allocateSlow_(std::size_t size, std::size_t alignment);
+    void *allocateSlow_(std::size_t size, std::size_t alignment, std::source_location source);
     bool tryAllocFromChunk_(ArenaChunk &c, std::size_t user, std::size_t align, void **out);
     static std::size_t alignUp_(std::size_t n, std::size_t a)
     {
         return (n + a - 1) & ~(a - 1);
     }
+    void appendChunk_(std::size_t minBytes);
     ArenaChunk newChunk_(std::size_t minBytes);
 
     // canaries
     void writeCanaries_(unsigned char *user, std::size_t size, std::size_t pre, std::size_t post);
-    void maybeJournal_(std::size_t size, std::size_t alignment);
+    void maybeJournal_(std::size_t size, std::size_t alignment, std::source_location source);
 
     struct CanaryRecord
     {
@@ -128,6 +131,7 @@ private:
     // state
     ArenaOptions opts_{};
     std::vector<ArenaChunk> chunks_;
+    std::size_t activeChunk_ = 0;
     std::size_t nextChunkBytes_ = 0;
     std::size_t totalBytes_ = 0;
     ArenaGroup *group_ = nullptr;
@@ -136,6 +140,7 @@ private:
     bool journalOn_ = false;
     std::vector<JournalEntry> journal_;
     std::size_t journalHead_ = 0;
+    std::size_t journalCount_ = 0;
 };
 
 class ThreadLocalArena
@@ -174,7 +179,7 @@ public:
 
     ~ArenaGroup();
     Chunk acquire(std::size_t minBytes, bool guards, bool preferHuge, int numaNode = -1, bool strictNuma = false);
-    void release(Chunk &&chunk);
+    void release(Chunk &&chunk) noexcept;
 
 private:
     // simple size-class bins (power-of-two-ish)

@@ -60,8 +60,8 @@ ArenaAllocator::ArenaAllocator(const ArenaOptions &opts)
         opts_.initial_chunk_size == 0 || opts_.max_chunk_size < opts_.initial_chunk_size)
         throw std::invalid_argument("invalid arena growth options");
     // start with one chunk
-    ArenaChunk first = newChunk_(0);
-    chunks_.push_back(std::move(first));
+    if (journalOn_) journal_.resize(1024);
+    appendChunk_(0);
 }
 
 ArenaAllocator::~ArenaAllocator()
@@ -85,6 +85,10 @@ ArenaAllocator::ArenaAllocator(ArenaAllocator &&o) noexcept
       journal_(std::move(o.journal_)),
       journalHead_(o.journalHead_)
 {
+    activeChunk_ = o.activeChunk_;
+    journalCount_ = o.journalCount_;
+    o.activeChunk_ = 0;
+    o.journalCount_ = 0;
     canaries_ = std::move(o.canaries_);
     o.canaries_.clear();
     o.nextChunkBytes_ = 0;
@@ -106,6 +110,10 @@ ArenaAllocator &ArenaAllocator::operator=(ArenaAllocator &&o) noexcept
     journalOn_ = o.journalOn_;
     journal_ = std::move(o.journal_);
     journalHead_ = o.journalHead_;
+    activeChunk_ = o.activeChunk_;
+    journalCount_ = o.journalCount_;
+    o.activeChunk_ = 0;
+    o.journalCount_ = 0;
     canaries_ = std::move(o.canaries_);
     o.canaries_.clear();
     o.nextChunkBytes_ = 0;
@@ -115,7 +123,7 @@ ArenaAllocator &ArenaAllocator::operator=(ArenaAllocator &&o) noexcept
     return *this;
 }
 
-void *ArenaAllocator::allocate(std::size_t bytes, std::size_t alignment)
+void *ArenaAllocator::allocate(std::size_t bytes, std::size_t alignment, std::source_location source)
 {
     if (bytes == 0)
         bytes = 1;
@@ -137,16 +145,16 @@ void *ArenaAllocator::allocate(std::size_t bytes, std::size_t alignment)
         (opts_.use_canaries && opts_.canary_size > (limit - overhead - alignment - bytes) / 2))
         throw std::bad_alloc();
 
-    // try current chunk
+    if (journalOn_ && journal_.empty()) journal_.resize(1024);
     void *out = nullptr;
-    if (!chunks_.empty() && tryAllocFromChunk_(chunks_.back(), bytes, alignment, &out))
-    {
-        totalBytes_ += bytes;
-        maybeJournal_(bytes, alignment);
-        return out;
-    }
-    // slow path: get a new chunk and retry
-    return allocateSlow_(bytes, alignment);
+    for (; activeChunk_ < chunks_.size(); ++activeChunk_)
+        if (tryAllocFromChunk_(chunks_[activeChunk_], bytes, alignment, &out))
+        {
+            totalBytes_ += bytes;
+            maybeJournal_(bytes, alignment, source);
+            return out;
+        }
+    return allocateSlow_(bytes, alignment, source);
 }
 
 void ArenaAllocator::validate() const
@@ -162,14 +170,16 @@ void ArenaAllocator::reset()
 {
     validate();
     canaries_.clear();
+    activeChunk_ = 0;
     for (auto &c : chunks_)
         c.offset = 0;
     totalBytes_ = 0;
     // keep chunks; journaling left intact
 }
 
-void ArenaAllocator::release()
+void ArenaAllocator::release() noexcept
 {
+    activeChunk_ = 0;
     // Release must always reclaim storage, even after a failed validation.
     canaries_.clear();
     // return slabs to group or OS
@@ -190,14 +200,14 @@ void ArenaAllocator::release()
 
 std::size_t ArenaAllocator::bytesRemaining() const
 {
-    if (chunks_.empty())
-        return 0;
-    const auto &c = chunks_.back();
-    return (c.size > c.offset) ? (c.size - c.offset) : 0;
+    std::size_t remaining = 0;
+    for (std::size_t i = activeChunk_; i < chunks_.size(); ++i)
+        remaining += chunks_[i].size - chunks_[i].offset;
+    return remaining;
 }
 
 // ---- private: slow path ----
-void *ArenaAllocator::allocateSlow_(std::size_t size, std::size_t alignment)
+void *ArenaAllocator::allocateSlow_(std::size_t size, std::size_t alignment, std::source_location source)
 {
     // Worst-case within a fresh chunk:
     // [header aligned to max_align] + pre_canary + alignment slack + user + post_canary
@@ -211,7 +221,8 @@ void *ArenaAllocator::allocateSlow_(std::size_t size, std::size_t alignment)
     want = std::max(worst, std::min(want, opts_.max_chunk_size));
 
     // acquire new chunk
-    chunks_.push_back(newChunk_(want));
+    appendChunk_(want);
+    activeChunk_ = chunks_.size() - 1;
 
     // advance growth for next time
     const double g = (opts_.growth_factor > 1.0) ? opts_.growth_factor : 2.0;
@@ -230,7 +241,8 @@ void *ArenaAllocator::allocateSlow_(std::size_t size, std::size_t alignment)
     if (!tryAllocFromChunk_(chunks_.back(), size, alignment, &out))
     {
         // Extremely unlikely; allocate an exact-fit chunk and try again.
-        chunks_.push_back(newChunk_(worst));
+        appendChunk_(worst);
+        activeChunk_ = chunks_.size() - 1;
         bool ok = tryAllocFromChunk_(chunks_.back(), size, alignment, &out);
         if (!ok)
         {
@@ -239,7 +251,7 @@ void *ArenaAllocator::allocateSlow_(std::size_t size, std::size_t alignment)
         }
     }
     totalBytes_ += size;
-    maybeJournal_(size, alignment);
+    maybeJournal_(size, alignment, source);
     return out;
 }
 
@@ -266,7 +278,7 @@ bool ArenaAllocator::tryAllocFromChunk_(ArenaChunk &c, std::size_t userSize, std
         canaries_.push_back({reinterpret_cast<unsigned char *>(userAddr), userSize});
 
     // write header
-    auto *hdr = reinterpret_cast<BlockHeader *>(hdrAddr);
+    auto *hdr = new (reinterpret_cast<void *>(hdrAddr)) BlockHeader{};
     hdr->magic = 0xABCD1234u;
     hdr->reserved = 0;
     hdr->payload_size = userSize;
@@ -307,25 +319,17 @@ void ArenaAllocator::writeCanaries_(unsigned char *user, std::size_t size, std::
         std::memset(user + size, opts_.canary_byte, post);
 }
 
-void ArenaAllocator::maybeJournal_(std::size_t size, std::size_t alignment)
+void ArenaAllocator::maybeJournal_(std::size_t size, std::size_t alignment, std::source_location source)
 {
     if (!journalOn_)
         return;
     if (size < opts_.journal_threshold_bytes)
         return;
 
-    if (journal_.empty())
-    {
-        // lazy init a small ring buffer
-        journal_.resize(1024);
-        journalHead_ = 0;
-    }
-    JournalEntry e;
-    e.size = size;
-    e.alignment = alignment;
-    e.retaddr = 0; // portable fallback (no backtrace in this build)
-    journal_[journalHead_] = e;
+    // Preallocated in the constructor: tracing cannot fail after carving memory.
+    journal_[journalHead_] = {size, alignment, source};
     journalHead_ = (journalHead_ + 1) % journal_.size();
+    journalCount_ = std::min(journalCount_ + 1, journal_.size());
 }
 
 // ---- OS chunk allocation ----
@@ -333,8 +337,19 @@ ArenaAllocator::ArenaChunk
 ArenaAllocator::osAllocChunk_(std::size_t usableBytes, bool guards, bool preferHuge, int numaNode, bool strictNuma)
 {
     ArenaChunk c;
+    if (usableBytes > static_cast<std::size_t>(std::numeric_limits<std::ptrdiff_t>::max()))
+        throw std::bad_alloc();
     c.size = std::max<std::size_t>(usableBytes, 4096);
     if (numaNode < -1 || numaNode > 1048575) throw std::invalid_argument("invalid NUMA node");
+#if defined(__linux__) && defined(SYS_mbind)
+    constexpr auto bits = sizeof(unsigned long) * 8;
+    std::vector<unsigned long> mask;
+    if (numaNode >= 0)
+    {
+        mask.resize(static_cast<std::size_t>(numaNode) / bits + 1, 0);
+        mask[numaNode / bits] |= 1UL << (numaNode % bits);
+    }
+#endif
     c.numa_node = numaNode;
     c.numa_strict = strictNuma;
     c.prefer_huge = preferHuge;
@@ -384,9 +399,6 @@ ArenaAllocator::osAllocChunk_(std::size_t usableBytes, bool guards, bool preferH
     if (numaNode >= 0)
     {
 #if defined(__linux__) && defined(SYS_mbind)
-        constexpr auto bits = sizeof(unsigned long) * 8;
-        std::vector<unsigned long> mask(static_cast<std::size_t>(numaNode) / bits + 1, 0);
-        mask[numaNode / bits] |= 1UL << (numaNode % bits);
         c.numa_policy_applied = (::syscall(SYS_mbind, c.base, c.size,
             strictNuma ? MPOL_BIND : MPOL_PREFERRED, mask.data(),
             static_cast<unsigned long>(numaNode + 1), 0UL) == 0);
@@ -463,8 +475,10 @@ ArenaGroup::Chunk ArenaGroup::acquire(std::size_t minBytes, bool guards, bool pr
     return ArenaAllocator::osAllocChunk_(want, guards, preferHuge, numaNode, strictNuma);
 }
 
-void ArenaGroup::release(Chunk &&chunk)
+void ArenaGroup::release(Chunk &&chunk) noexcept
 {
+    try
+    {
     if (!chunk.base || chunk.size == 0)
         return;
     std::lock_guard<std::mutex> lock(mtx_);
@@ -474,6 +488,8 @@ void ArenaGroup::release(Chunk &&chunk)
     chunk.offset = 0;
     bins_[idx].slabs.push_back(chunk);
     chunk = {};
+    }
+    catch (...) { ArenaAllocator::osFreeChunk_(chunk); }
 }
 
 ArenaGroup::~ArenaGroup()
@@ -496,4 +512,20 @@ ArenaAllocator::MemoryStats ArenaAllocator::memoryStats() const
         s.numa_failed_chunks += c.numa_node >= 0 && !c.numa_policy_applied;
     }
     return s;
+}
+
+void ArenaAllocator::appendChunk_(std::size_t minBytes)
+{
+    auto chunk = newChunk_(minBytes);
+    try { chunks_.push_back(chunk); }
+    catch (...) { osFreeChunk_(chunk); throw; }
+}
+
+std::vector<ArenaAllocator::JournalEntry> ArenaAllocator::journalSnapshot() const
+{
+    std::vector<JournalEntry> entries;
+    entries.reserve(journalCount_);
+    for (std::size_t i = 0; i < journalCount_; ++i)
+        entries.push_back(journal_[(journalHead_ + journal_.size() - journalCount_ + i) % journal_.size()]);
+    return entries;
 }
