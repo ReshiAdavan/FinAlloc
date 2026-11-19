@@ -16,6 +16,8 @@ struct ArenaOptions
 
     bool guard_pages = false;
     bool prefer_huge = false;
+    int numa_node = -1; // Linux preferred node; -1 uses the process policy
+    bool strict_numa = false;
 
     bool use_canaries = false;
     std::size_t canary_size = 0;
@@ -39,6 +41,10 @@ public:
         bool guard_pages = false;
         bool prefer_huge = false;
         bool huge_page_advised = false; // advice accepted, not a physical residency guarantee
+        int numa_node = -1;
+        bool numa_strict = false;
+        bool numa_policy_applied = false;
+        int numa_policy_error = 0;
         void *mapping_base = nullptr;
         std::size_t mapping_size = 0;
         std::size_t usableSize() const { return size; }
@@ -68,9 +74,15 @@ public:
 
     std::size_t chunkCount() const { return chunks_.size(); }
     std::size_t bytesRemaining() const;
+    struct MemoryStats
+    {
+        std::size_t reserved = 0, consumed = 0, payload = 0, chunks = 0;
+        std::size_t numa_bound_chunks = 0, numa_failed_chunks = 0;
+    };
+    MemoryStats memoryStats() const;
     const ArenaOptions &options() const { return opts_; }
 
-    static ArenaChunk osAllocChunk_(std::size_t usableBytes, bool guards, bool preferHuge);
+    static ArenaChunk osAllocChunk_(std::size_t usableBytes, bool guards, bool preferHuge, int numaNode = -1, bool strictNuma = false);
     static void osFreeChunk_(ArenaChunk &c);
 
     void attachGroup(ArenaGroup *g) { group_ = g; }
@@ -161,7 +173,7 @@ public:
     using Chunk = ArenaAllocator::ArenaChunk;
 
     ~ArenaGroup();
-    Chunk acquire(std::size_t minBytes, bool guards, bool preferHuge);
+    Chunk acquire(std::size_t minBytes, bool guards, bool preferHuge, int numaNode = -1, bool strictNuma = false);
     void release(Chunk &&chunk);
 
 private:
