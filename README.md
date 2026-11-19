@@ -68,7 +68,7 @@ Set `use_canaries=true` and `canary_size=16` for payload red zones; call
 `release()` and destruction always reclaim storage, including corrupted arenas.
 ArenaGroup must outlive attached arenas; it releases cached slabs on destruction.
 Arenas are single-threaded; use one per thread or external synchronization.
-`construct<T>` does not register destructors; explicitly destroy nontrivial objects
+`construct<T>` does not register destructors; call `arena.destroy(p)` for nontrivial objects
 before reset/release. Requests larger than max_chunk_size use dedicated chunks.
 
 # Linux huge-page preference
@@ -141,3 +141,14 @@ thread-safe when used concurrently. Pool destruction requires all callers to
 have stopped. As with standard allocators, invalid/double frees are caller errors.
 Fixed pools support fundamental alignment; over-aligned typed construction is
 rejected. Failed constructors return their slot to the pool.
+
+# allocation tracing and reuse
+
+With `journaling=true`, `journalSnapshot()` returns the latest 1024 qualifying
+allocations in chronological order, including size, normalized alignment, and
+C++20 `source_location` (file, line, function). `journal_threshold_bytes` filters
+small allocations. `allocate()` captures its caller; allocations made by
+`construct()` report the template's allocation site. The ring is bounded and
+preallocated; reset/release preserve its history. Snapshot retrieval copies it.
+After reset, retained chunks are reused in order before growing the arena.
+`bytesRemaining()` sums remaining capacity from the current chunk onward.
