@@ -34,7 +34,7 @@ custom memory allocator for quant infra
 - [x] Multi-Chunk Growth Strategy [Dynamically allocates new chunks as the arena fills; allows for amortized linear growth with high locality]
 - [x] Custom construct<T>(...) [API Supports object lifetime mgmt inside arena (T* ptr = arena.construct<T>(...))]
 - [x] Memory Alignment + Padding Metadata [Tracks aligned offsets and optionally embeds headers to record allocation metadata]
-- [ ] Guard Pages / Canary Support [For memory corruption detection (e.g., red zone under/overruns)]
+- [x] Guard Pages / Canary Support [For memory corruption detection (e.g., red zone under/overruns)]
 - [x] Thread-local Sub-Arenas [Arena-per-thread to avoid false sharing, tuned for CPU core affinity]
 - [x] Arena Group Manager [Shared chunk pool to reuse arenas between sessions (recycle slabs)]
 - [x] Journaling or Allocation Tracing Mode [For debugging perf regressions, e.g., log large allocations with source info]
@@ -58,3 +58,15 @@ custom memory allocator for quant infra
 - [ ] Load-Balanced NUMA-Aware Arena Pools [Dynamically reallocate arenas across NUMA nodes to handle usage skew]
 - [ ] Hardware Prefetch Hints [Use cache line prefetching (_mm_prefetch) to reduce stalls on frequent access patterns]
 - [ ] NUMA-Integrated Memory Profiler [Visualize how much memory per NUMA node is in use, fragmented, idle]
+
+# arena safety
+
+Set `guard_pages=true` for inaccessible pages at both **chunk** boundaries
+(POSIX systems). These catch chunk-boundary accesses, not every payload overrun.
+Set `use_canaries=true` and `canary_size=16` for payload red zones; call
+`validate()` or `reset()` to check them (`std::runtime_error` on corruption).
+`release()` and destruction always reclaim storage, including corrupted arenas.
+ArenaGroup must outlive attached arenas; it releases cached slabs on destruction.
+Arenas are single-threaded; use one per thread or external synchronization.
+`construct<T>` does not register destructors; explicitly destroy nontrivial objects
+before reset/release. Requests larger than max_chunk_size use dedicated chunks.
