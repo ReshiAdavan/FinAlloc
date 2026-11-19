@@ -11,6 +11,7 @@
 #include <atomic>
 #include <mutex>
 #include <vector>
+#include <memory>
 
 #include "allocators/poolConfig.hpp"
 #include "utils/histogram.hpp"
@@ -42,6 +43,12 @@ public:
     std::size_t capacity() const { return poolCapacity; }
     void *memory() const { return memoryBlock; }
     std::size_t blockSize() const { return alignedObjSize * poolCapacity; }
+    bool owns(void *p) const
+    {
+        auto u = reinterpret_cast<std::uintptr_t>(p);
+        auto base = reinterpret_cast<std::uintptr_t>(memoryBlock);
+        return u >= base && u - base < blockSize() && (u - base) % alignedObjSize == 0;
+    }
     const PoolOptions &config() const { return options_; }
 
     PoolStats getStats() const; // snapshot
@@ -49,8 +56,12 @@ public:
     template <typename T, typename... Args>
     T *construct(Args &&...args)
     {
+        if (sizeof(T) > alignedObjSize || alignof(T) > alignof(std::max_align_t))
+            throw std::bad_alloc();
         void *mem = allocate();
-        return mem ? new (mem) T(std::forward<Args>(args)...) : nullptr;
+        if (!mem) return nullptr;
+        try { return new (mem) T(std::forward<Args>(args)...); }
+        catch (...) { deallocate(mem); throw; }
     }
 
     template <typename T>
@@ -110,10 +121,17 @@ public:
 
 private:
     // Lock-free LIFO head
-    std::atomic<void *> freeListHead;
+    static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+    // Low 32 bits: index, high 32 bits: mutation tag (ABA protection).
+    static constexpr std::uint32_t empty_ = UINT32_MAX;
+    std::atomic<std::uint64_t> freeListHead;
+    static std::uint64_t tagged_(std::uint64_t old, std::uint32_t index)
+    {
+        return ((old + (std::uint64_t{1} << 32)) & 0xFFFFFFFF00000000ULL) | index;
+    }
 
     // Side-array for next pointers (out-of-line links)
-    std::vector<void *> next_;
+    std::unique_ptr<std::atomic<std::uint32_t>[]> next_;
 
     // optional global quarantine for deferred free
     std::vector<void *> lfQuarantine_; // protected by mutex_

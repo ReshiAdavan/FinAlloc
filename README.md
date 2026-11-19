@@ -35,7 +35,7 @@ custom memory allocator for quant infra
 - [x] Custom construct<T>(...) [API Supports object lifetime mgmt inside arena (T* ptr = arena.construct<T>(...))]
 - [x] Memory Alignment + Padding Metadata [Tracks aligned offsets and optionally embeds headers to record allocation metadata]
 - [x] Guard Pages / Canary Support [For memory corruption detection (e.g., red zone under/overruns)]
-- [x] Thread-local Sub-Arenas [Arena-per-thread to avoid false sharing, tuned for CPU core affinity]
+- [x] Thread-local Sub-Arenas [Arena-per-thread; CPU pinning remains the caller's responsibility]
 - [x] Arena Group Manager [Shared chunk pool to reuse arenas between sessions (recycle slabs)]
 - [x] Journaling or Allocation Tracing Mode [For debugging perf regressions, e.g., log large allocations with source info]
 - [x] HugePage Support (Linux) [Backed by mmap with MAP_HUGETLB or madvise for better TLB performance]
@@ -47,7 +47,7 @@ custom memory allocator for quant infra
 - [x] Thread-local Buffer Caches [Per-thread pools that reduce global contention and allocate in batches]
 - [x] Object Lifecycle Hooks [Optional callbacks for constructor/destructor on reuse, even for PODs]
 - [x] Zeroing or Poisoning Support [Debug mode wipes memory on alloc/dealloc to detect uninitialized accesses]
-- [x] Usage Metrics and Histograms [Track alloc counts, dealloc counts, high-water marks, fragmentation over time]
+- [x] Usage Metrics and Histograms [Track allocation/free counts, occupancy histograms, failures, and high-water marks]
 - [x] Deferred Freeing / Quarantine [Introduce latency before freeing to detect use-after-free or memory races]
 
 3. numa allocator
@@ -120,3 +120,24 @@ payload access and reset lifetimes remain the caller's responsibility. The
 spillover threshold measures payload bytes, not reserved memory or a hard limit.
 CSV profiling separates payload, padding/headers, unused capacity, and policy
 success/failure. No multi-socket performance claim is implied by these features.
+
+# shared pools and thread caches
+
+`ThreadCachedPool` in `allocators/threadCachedPool.hpp` provides bounded per-thread
+caches backed by a shared pool: `ThreadCachedPool pool(64, 4096, 16, 32)` chooses
+64-byte objects, 4096 blocks, refill batch 16, cache limit 32. Call `allocate()`,
+`deallocate(p)`, and optionally `drainCurrentThread()`. Thread exit flushes cached
+blocks. Cross-thread frees are supported. Cached blocks reserve shared capacity,
+so allocation may fail while another thread holds idle blocks; drain caches when
+capacity must be globally available. `used()` counts user allocations;
+`backingStats()` includes cache reservations. This wrapper uses minimal pool
+options; lifecycle/debug hooks belong to the underlying pool API.
+
+The shared free list uses atomic side links and a 64-bit tagged index head. Its
+32-bit mutation tag assumes no operation stalls across 2^32 head mutations;
+applications requiring arbitrarily suspended threads need a reclamation scheme.
+Head atomics must be lock-free on the target platform. Pool callbacks must be
+thread-safe when used concurrently. Pool destruction requires all callers to
+have stopped. As with standard allocators, invalid/double frees are caller errors.
+Fixed pools support fundamental alignment; over-aligned typed construction is
+rejected. Failed constructors return their slot to the pool.

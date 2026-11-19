@@ -9,3 +9,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make test -j2 CXX=clang++ CXXFLAGS='-std=c++20 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude' LDFLAGS='-fsanitize=address,undefined -pthread'
+  thread-sanitizer:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make bin/poolConcurrencyTest CXX=clang++ CXXFLAGS='-std=c++20 -O1 -g -Wall -Wextra -Werror -fsanitize=thread -Iinclude' LDFLAGS='-fsanitize=thread -pthread'
+      - run: ./bin/poolConcurrencyTest

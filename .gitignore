@@ -37,3 +37,5 @@
 # FinAlloc
 bin/
 build/
+bin-tsan/
+build-tsan/
