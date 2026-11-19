@@ -10,24 +10,25 @@ custom memory allocator for quant infra
 # run
 
 - run tests via `make test`
-- executable via `./bin/finalloc`
+- executable via `./bin/asan/finalloc`
 - benchmark via:
 
 ```
-# per-thread pool, immediate alloc/free
-./bin/allocBench --allocator=pool --threads=8 --iters=100000 --size=64
+# Build uninstrumented benchmarks: make PROFILE=release bench
+# per-thread pool, one live allocation
+./bin/release/allocBench --allocator=pool --threads=8 --iters=100000 --size=64 --live=1
 
 # lock-free pool, with a live set of 1024 (churn)
-./bin/allocBench --allocator=lockfree --threads=8 --iters=200000 --size=64 --live=1024
+./bin/release/allocBench --allocator=lockfree --threads=8 --iters=200000 --size=64 --live=1024
 
-# arena (per-thread). With --live>0 it does epoch resets every live/threads ops
-./bin/allocBench --allocator=arena --threads=8 --iters=200000 --size=64
+# arena (per-thread): reset at each per-thread live-set epoch
+./bin/release/allocBench --allocator=arena --threads=8 --iters=200000 --size=64
 
 # baseline new/delete (immediate or churn with --live)
-./bin/allocBench --allocator=new --threads=8 --iters=50000 --size=64
+./bin/release/allocBench --allocator=new --threads=8 --iters=50000 --size=64
 ```
 
-# todos
+# features
 
 1. arena allocator
 
@@ -42,7 +43,7 @@ custom memory allocator for quant infra
 
 2. pool allocator
 
-- [x] Lock-Free Free List [Use std::atomic<void*> with compare-and-swap to allow concurrent allocation/deallocation]
+- [x] Lock-Free Free List [Use an atomic tagged index with compare-and-swap to allow concurrent allocation/deallocation]
 - [x] Size-Class Bucketing [Support multiple object sizes by grouping into power-of-two buckets (like tcmalloc)]
 - [x] Thread-local Buffer Caches [Per-thread pools that reduce global contention and allocate in batches]
 - [x] Object Lifecycle Hooks [Optional callbacks for constructor/destructor on reuse, even for PODs]
@@ -152,3 +153,13 @@ small allocations. `allocate()` captures its caller; allocations made by
 preallocated; reset/release preserve its history. Snapshot retrieval copies it.
 After reset, retained chunks are reused in order before growing the arena.
 `bytesRemaining()` sums remaining capacity from the current chunk onward.
+
+# benchmark builds and reports
+
+`make PROFILE=release bench` builds `bin/release/allocBench` without sanitizers.
+`make PROFILE=asan all test` and `make tsan` keep correctness builds separate.
+The harness includes thread caches, NUMA, standard PMR resources, JSON/CSV output,
+repetitions, sampled operation latency, and a separate ownership-verification
+mode. Generate a comparison with `python3 tools/bench_report.py`.
+See [benchmark methodology](docs/benchmarking.md) for exact measurement boundaries,
+platform skips, memory accounting, and optional mimalloc support.

@@ -39,3 +39,6 @@ bin/
 build/
 bin-tsan/
 build-tsan/
+
+benchmark-results/
+__pycache__/

@@ -8,10 +8,24 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: make all test -j2 CXX=clang++ CXXFLAGS='-std=c++20 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude' LDFLAGS='-fsanitize=address,undefined -pthread'
+      - run: make PROFILE=asan all test -j2 CXX=clang++
   thread-sanitizer:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - run: make bin/poolConcurrencyTest CXX=clang++ CXXFLAGS='-std=c++20 -O1 -g -Wall -Wextra -Werror -fsanitize=thread -Iinclude' LDFLAGS='-fsanitize=thread -pthread'
-      - run: ./bin/poolConcurrencyTest
+      - run: make PROFILE=tsan bin/tsan/poolConcurrencyTest CXX=clang++
+      - run: ./bin/tsan/poolConcurrencyTest
+  benchmark-contracts:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: make PROFILE=release bench -j2 CXX=clang++
+      - run: python3 tests/benchmarkHarnessTest.py bin/release/allocBench
+      - run: python3 tools/bench_report.py --allocators=empty,new,cached,numa --threads=1 --sizes=64 --live=16 --iters=2000 --repetitions=2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-smoke-${{ matrix.os }}
+          path: benchmark-results/
