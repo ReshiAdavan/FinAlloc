@@ -322,31 +322,45 @@ void ArenaAllocator::maybeJournal_(std::size_t size, std::size_t alignment)
 
 // ---- OS chunk allocation ----
 ArenaAllocator::ArenaChunk
-ArenaAllocator::osAllocChunk_(std::size_t usableBytes, bool guards, bool /*preferHuge*/)
+ArenaAllocator::osAllocChunk_(std::size_t usableBytes, bool guards, bool preferHuge)
 {
     ArenaChunk c;
     c.size = std::max<std::size_t>(usableBytes, 4096);
-    if (guards)
+    c.prefer_huge = preferHuge;
+    bool map = guards;
+#if defined(__linux__)
+    map = map || preferHuge;
+#endif
+    if (map)
     {
 #if defined(__unix__) || defined(__APPLE__)
         const long rawPage = ::sysconf(_SC_PAGESIZE);
         if (rawPage <= 0) throw std::bad_alloc();
         const auto page = static_cast<std::size_t>(rawPage);
         const auto limit = std::numeric_limits<std::size_t>::max();
-        if (c.size > limit - 3 * page) throw std::bad_alloc();
-        c.size = ((c.size + page - 1) / page) * page;
-        c.mapping_size = c.size + 2 * page;
+        std::size_t granularity = page;
+#if defined(__linux__)
+        if (preferHuge) granularity = std::max(page, std::size_t{2 * 1024 * 1024});
+#endif
+        if (c.size > limit - granularity - 2 * page) throw std::bad_alloc();
+        c.size = ((c.size + granularity - 1) / granularity) * granularity;
+        if (c.size > limit - granularity - 2 * page) throw std::bad_alloc();
+        c.mapping_size = c.size + granularity + 2 * page;
         c.mapping_base = ::mmap(nullptr, c.mapping_size, PROT_NONE,
                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (c.mapping_base == MAP_FAILED) throw std::bad_alloc();
-        c.base = static_cast<char *>(c.mapping_base) + page;
+        const auto start = reinterpret_cast<std::uintptr_t>(c.mapping_base) + page;
+        c.base = reinterpret_cast<void *>(((start + granularity - 1) / granularity) * granularity);
         if (::mprotect(c.base, c.size, PROT_READ | PROT_WRITE) != 0)
         {
             ::munmap(c.mapping_base, c.mapping_size);
             throw std::bad_alloc();
         }
         c.use_mmap = true;
-        c.guard_pages = true;
+        c.guard_pages = guards;
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+        if (preferHuge) c.huge_page_advised = (::madvise(c.base, c.size, MADV_HUGEPAGE) == 0);
+#endif
 #else
         throw std::runtime_error("guard pages require POSIX mmap");
 #endif
@@ -405,7 +419,7 @@ ArenaGroup::Chunk ArenaGroup::acquire(std::size_t minBytes, bool guards, bool pr
     {
         auto &vec = bins_[i].slabs;
         for (auto it = vec.begin(); it != vec.end(); ++it)
-            if (it->size >= minBytes && it->guard_pages == guards)
+            if (it->size >= minBytes && it->guard_pages == guards && it->prefer_huge == preferHuge)
             {
                 Chunk c = *it;
                 vec.erase(it);
