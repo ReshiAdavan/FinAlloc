@@ -7,6 +7,12 @@
 #include <limits>
 #include <cmath>
 #include <stdexcept>
+#include <cerrno>
+#include <system_error>
+#if defined(__linux__)
+#include <linux/mempolicy.h>
+#include <sys/syscall.h>
+#endif
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/mman.h>
 #include <unistd.h>
@@ -48,6 +54,8 @@ ArenaAllocator::ArenaAllocator(const ArenaOptions &opts)
       journal_(),
       journalHead_(0)
 {
+    if (opts_.numa_node < -1 || opts_.numa_node > 1048575)
+        throw std::invalid_argument("invalid NUMA node");
     if (!std::isfinite(opts_.growth_factor) || opts_.growth_factor < 1.0 ||
         opts_.initial_chunk_size == 0 || opts_.max_chunk_size < opts_.initial_chunk_size)
         throw std::invalid_argument("invalid arena growth options");
@@ -285,9 +293,9 @@ ArenaAllocator::ArenaChunk ArenaAllocator::newChunk_(std::size_t minBytes)
     // group_ may be null (no recycler)
     if (group_)
     {
-        return group_->acquire(want, opts_.guard_pages, opts_.prefer_huge);
+        return group_->acquire(want, opts_.guard_pages, opts_.prefer_huge, opts_.numa_node, opts_.strict_numa);
     }
-    return osAllocChunk_(want, opts_.guard_pages, opts_.prefer_huge);
+    return osAllocChunk_(want, opts_.guard_pages, opts_.prefer_huge, opts_.numa_node, opts_.strict_numa);
 }
 
 // ---- private: canaries and journaling ----
@@ -322,14 +330,17 @@ void ArenaAllocator::maybeJournal_(std::size_t size, std::size_t alignment)
 
 // ---- OS chunk allocation ----
 ArenaAllocator::ArenaChunk
-ArenaAllocator::osAllocChunk_(std::size_t usableBytes, bool guards, bool preferHuge)
+ArenaAllocator::osAllocChunk_(std::size_t usableBytes, bool guards, bool preferHuge, int numaNode, bool strictNuma)
 {
     ArenaChunk c;
     c.size = std::max<std::size_t>(usableBytes, 4096);
+    if (numaNode < -1 || numaNode > 1048575) throw std::invalid_argument("invalid NUMA node");
+    c.numa_node = numaNode;
+    c.numa_strict = strictNuma;
     c.prefer_huge = preferHuge;
     bool map = guards;
 #if defined(__linux__)
-    map = map || preferHuge;
+    map = map || preferHuge || numaNode >= 0;
 #endif
     if (map)
     {
@@ -370,6 +381,26 @@ ArenaAllocator::osAllocChunk_(std::size_t usableBytes, bool guards, bool preferH
         c.base = std::malloc(c.size);
         if (!c.base) throw std::bad_alloc();
     }
+    if (numaNode >= 0)
+    {
+#if defined(__linux__) && defined(SYS_mbind)
+        constexpr auto bits = sizeof(unsigned long) * 8;
+        std::vector<unsigned long> mask(static_cast<std::size_t>(numaNode) / bits + 1, 0);
+        mask[numaNode / bits] |= 1UL << (numaNode % bits);
+        c.numa_policy_applied = (::syscall(SYS_mbind, c.base, c.size,
+            strictNuma ? MPOL_BIND : MPOL_PREFERRED, mask.data(),
+            static_cast<unsigned long>(numaNode + 1), 0UL) == 0);
+        if (!c.numa_policy_applied) c.numa_policy_error = errno;
+#else
+        c.numa_policy_error = ENOTSUP;
+#endif
+        if (strictNuma && !c.numa_policy_applied)
+        {
+            const int error = c.numa_policy_error;
+            osFreeChunk_(c);
+            throw std::system_error(error, std::generic_category(), "NUMA memory policy");
+        }
+    }
     return c;
 }
 
@@ -408,7 +439,7 @@ namespace
     }
 }
 
-ArenaGroup::Chunk ArenaGroup::acquire(std::size_t minBytes, bool guards, bool preferHuge)
+ArenaGroup::Chunk ArenaGroup::acquire(std::size_t minBytes, bool guards, bool preferHuge, int numaNode, bool strictNuma)
 {
     std::lock_guard<std::mutex> lock(mtx_);
     const std::size_t idx = pick_index(minBytes);
@@ -419,7 +450,8 @@ ArenaGroup::Chunk ArenaGroup::acquire(std::size_t minBytes, bool guards, bool pr
     {
         auto &vec = bins_[i].slabs;
         for (auto it = vec.begin(); it != vec.end(); ++it)
-            if (it->size >= minBytes && it->guard_pages == guards && it->prefer_huge == preferHuge)
+            if (it->size >= minBytes && it->guard_pages == guards && it->prefer_huge == preferHuge &&
+                it->numa_node == numaNode && (!strictNuma || (it->numa_policy_applied && it->numa_strict)))
             {
                 Chunk c = *it;
                 vec.erase(it);
@@ -428,7 +460,7 @@ ArenaGroup::Chunk ArenaGroup::acquire(std::size_t minBytes, bool guards, bool pr
             }
     }
     const std::size_t want = std::max(minBytes, class_bytes(idx));
-    return ArenaAllocator::osAllocChunk_(want, guards, preferHuge);
+    return ArenaAllocator::osAllocChunk_(want, guards, preferHuge, numaNode, strictNuma);
 }
 
 void ArenaGroup::release(Chunk &&chunk)
@@ -449,4 +481,19 @@ ArenaGroup::~ArenaGroup()
     for (auto &bin : bins_)
         for (auto &chunk : bin.slabs)
             ArenaAllocator::osFreeChunk_(chunk);
+}
+
+ArenaAllocator::MemoryStats ArenaAllocator::memoryStats() const
+{
+    MemoryStats s;
+    s.payload = totalBytes_;
+    s.chunks = chunks_.size();
+    for (const auto &c : chunks_)
+    {
+        s.reserved += c.size;
+        s.consumed += c.offset;
+        s.numa_bound_chunks += c.numa_policy_applied;
+        s.numa_failed_chunks += c.numa_node >= 0 && !c.numa_policy_applied;
+    }
+    return s;
 }

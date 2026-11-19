@@ -52,12 +52,12 @@ custom memory allocator for quant infra
 
 3. numa allocator
 
-- [ ] Per-Node Slab Allocators [Maintain separate arena/pool per NUMA node (e.g., node 0 handles threads 0–15)]
-- [ ] Thread Affinity Registry [Track each thread’s CPU/core → node mapping dynamically]
-- [ ] Cross-Node Allocation Detection [Warn if a thread allocates from a remote NUMA node]
-- [ ] Load-Balanced NUMA-Aware Arena Pools [Dynamically reallocate arenas across NUMA nodes to handle usage skew]
-- [ ] Hardware Prefetch Hints [Use cache line prefetching (_mm_prefetch) to reduce stalls on frequent access patterns]
-- [ ] NUMA-Integrated Memory Profiler [Visualize how much memory per NUMA node is in use, fragmented, idle]
+- [x] Per-node slab arenas with Linux memory policy before first touch
+- [x] Thread registry refreshed from current CPU/node on allocation
+- [x] Cross-node allocation counters
+- [x] Local-first routing with load-based spillover and idle arena rebalancing
+- [x] Portable hardware prefetch hints
+- [x] Per-node payload, overhead, idle capacity, policy and allocation profiling (CSV)
 
 # arena safety
 
@@ -82,3 +82,41 @@ accepted advice; `prefer_huge` records the request for compatible slab reuse.
 It can be combined with guard pages. Small arenas may waste up to a few MiB;
 use this option for large working sets. No reserved hugetlb pool is required.
 See [Linux THP documentation](https://docs.kernel.org/admin-guide/mm/transhuge.html).
+
+# NUMA API
+
+```cpp
+#include "allocators/numaAllocator.hpp"
+#include <iostream>
+NumaOptions opts;
+opts.arena.initial_chunk_size = 1 << 20;
+opts.arena.strict_numa = false;
+opts.spillover_bytes = 16 << 20;
+NumaAllocator alloc(opts);
+void *p = alloc.allocate(4096, 64); // local node first; least-used node on spillover
+NumaAllocator::prefetch(p);
+alloc.writeProfile(std::cout);
+```
+
+Linux discovers process-allowed memory nodes from `/proc/self/status` and samples
+CPU/node via `getcpu` on each allocation, so migration updates the registry.
+`allocate(bytes, alignment, node)` explicitly chooses a configured node and bypasses
+spillover. Remote counters compare the requested node with the observed CPU node;
+they do not claim to measure physical page residency. Registry entries are latest
+observations, retained until allocator destruction (thread IDs may be reused).
+
+Each node owns its own arena; Linux applies `mbind(MPOL_PREFERRED)` to new anonymous
+mappings before arena headers or payloads are touched. Policy rejection (including
+container restrictions) is counted in `numa_failed_chunks`. Set `strict_numa=true`
+for `MPOL_BIND` and an exception if binding fails. Other platforms use a single
+logical node by default and report unsupported policy; strict mode throws.
+See [Linux mbind semantics](https://man7.org/linux/man-pages/man2/mbind.2.html).
+
+`resetNode`/`reset` invalidate affected allocations; callers must ensure no users
+remain. `rebalanceIdle(target)` reclaims other reset/empty arenas and provisions
+the target when empty; future slabs are allocated under their destination policy.
+It never relocates live objects. All allocator methods serialize metadata access;
+payload access and reset lifetimes remain the caller's responsibility. The
+spillover threshold measures payload bytes, not reserved memory or a hard limit.
+CSV profiling separates payload, padding/headers, unused capacity, and policy
+success/failure. No multi-socket performance claim is implied by these features.
