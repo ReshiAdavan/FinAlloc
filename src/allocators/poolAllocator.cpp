@@ -1,6 +1,9 @@
 #include "allocators/poolAllocator.hpp"
 #include <iostream>
 #include <limits>
+#include "utils/allocationControl.hpp"
+using finalloc::testing::AllocationDomain;
+using finalloc::testing::checkpoint;
 
 PoolAllocator::PoolAllocator(std::size_t objectSize, std::size_t capacity,
                              PoolOptions options)
@@ -17,9 +20,26 @@ PoolAllocator::PoolAllocator(std::size_t objectSize, std::size_t capacity,
         throw std::bad_alloc();
     const std::size_t totalSize = alignedObjSize * poolCapacity;
 
+    // Prepare throwing metadata before taking ownership of raw backing storage.
+    std::unique_ptr<Histogram> histogram;
+    if (options_.sample_histograms)
+    {
+        checkpoint(AllocationDomain::metadata);
+        histogram = std::make_unique<Histogram>(0, poolCapacity, options_.histogram_buckets);
+    }
+    if (options_.quarantine_size > 0)
+    {
+        if (options_.quarantine_size == std::numeric_limits<std::size_t>::max())
+            throw std::invalid_argument("quarantine size overflow");
+        checkpoint(AllocationDomain::metadata);
+        quarantine_.reserve(options_.quarantine_size + 1);
+    }
+    checkpoint(AllocationDomain::backing);
     memoryBlock = std::malloc(totalSize);
     if (!memoryBlock)
         throw std::bad_alloc();
+    finalloc::testing::acquired();
+    occupancyHist_ = histogram.release();
 
     // Build single-thread free list (in-block links used only by base class)
     void *block = memoryBlock;
@@ -52,23 +72,14 @@ PoolAllocator::PoolAllocator(std::size_t objectSize, std::size_t capacity,
     metrics_.in_use.store(0, std::memory_order_relaxed);
     metrics_.high_watermark.store(0, std::memory_order_relaxed);
 
-    // Optional histogram
-    if (options_.sample_histograms)
-    {
-        occupancyHist_ = new Histogram(0, poolCapacity, options_.histogram_buckets);
-    }
 
-    // Quarantine storage (single-thread) — reserve once
-    if (options_.quarantine_size > 0)
-    {
-        quarantine_.reserve(options_.quarantine_size + 1);
-    }
 }
 
 PoolAllocator::~PoolAllocator()
 {
     delete occupancyHist_;
     occupancyHist_ = nullptr;
+    if (memoryBlock) finalloc::testing::released();
     std::free(memoryBlock);
     memoryBlock = nullptr;
     nonAtomicFreeListHead = nullptr;
@@ -218,6 +229,7 @@ LockFreePoolAllocator::LockFreePoolAllocator(std::size_t objectSize, std::size_t
       freeListHead(0)
 {
     // Build side-array links
+    checkpoint(AllocationDomain::metadata);
     next_ = std::make_unique<std::atomic<std::uint32_t>[]>(poolCapacity);
     for (std::size_t i = 0; i + 1 < poolCapacity; ++i)
     {
@@ -227,6 +239,7 @@ LockFreePoolAllocator::LockFreePoolAllocator(std::size_t objectSize, std::size_t
 
     if (options_.quarantine_size > 0)
     {
+        checkpoint(AllocationDomain::metadata);
         lfQuarantine_.reserve(options_.quarantine_size + 1);
     }
 }

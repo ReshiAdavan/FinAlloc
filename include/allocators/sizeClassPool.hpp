@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 #include "poolAllocator.hpp"
+#include "utils/allocationControl.hpp"
 
 template <typename AllocatorType = PoolAllocator>
 class SizeClassPool
@@ -27,6 +28,7 @@ public:
         size_t bucketSize = alignToBucket(size);
         if (buckets.find(bucketSize) == buckets.end())
         {
+            finalloc::testing::checkpoint(finalloc::testing::AllocationDomain::metadata);
             buckets[bucketSize] = std::make_unique<AllocatorType>(bucketSize, objectsPerBucket);
         }
         return buckets[bucketSize]->allocate();

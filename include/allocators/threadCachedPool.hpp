@@ -1,6 +1,7 @@
 #pragma once
 #include "poolAllocator.hpp"
 #include <map>
+#include "utils/allocationControl.hpp"
 
 // A bounded cache per calling thread. Any thread may return a valid allocation.
 // The wrapper must outlive all outstanding user allocations. Thread exit returns
@@ -19,7 +20,7 @@ class ThreadCachedPool
     {
         std::weak_ptr<State> state;
         std::vector<void *> blocks;
-        explicit Cache(const std::shared_ptr<State> &s) : state(s) { blocks.reserve(s->limit); }
+        explicit Cache(const std::shared_ptr<State> &s) : state(s) { finalloc::testing::checkpoint(finalloc::testing::AllocationDomain::metadata); blocks.reserve(s->limit); }
         ~Cache()
         {
             if (auto s = state.lock())
@@ -39,7 +40,10 @@ class ThreadCachedPool
         Key key = state_;
         auto it = caches_.find(key);
         if (it == caches_.end())
+        {
+            finalloc::testing::checkpoint(finalloc::testing::AllocationDomain::metadata);
             it = caches_.emplace(key, std::make_unique<Cache>(state_)).first;
+        }
         return *it->second;
     }
 public:
@@ -47,6 +51,7 @@ public:
                      std::size_t batch = 16, std::size_t cacheLimit = 32)
     {
         if (!batch || cacheLimit < batch) throw std::invalid_argument("invalid cache sizes");
+        finalloc::testing::checkpoint(finalloc::testing::AllocationDomain::metadata);
         state_ = std::make_shared<State>(size, capacity, batch, cacheLimit);
     }
     ThreadCachedPool(const ThreadCachedPool &) = delete;

@@ -1,6 +1,6 @@
 # Proposed next phase
 
-Status: PR A is implemented; PR E is next. Remaining entries are scoped proposals.
+Status: PR A and PR E are implemented. Remaining entries are scoped proposals.
 
 Assumption: the original feature checklist is complete at the documented scope.
 The next phase should make FinAlloc useful inside a real C++ application and
@@ -112,7 +112,7 @@ Acceptance:
 - Tests distinguish payload exhaustion from metadata exhaustion.
 - Do not call this hard real-time: scheduling and cache/page behavior still vary.
 
-## PR E: Fuzzing and failure-injection infrastructure
+## PR E: Fuzzing and failure-injection infrastructure (implemented)
 
 Priority: alongside A/B. Size: medium. Dependencies: none.
 

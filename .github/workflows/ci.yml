@@ -29,3 +29,17 @@ jobs:
         with:
           name: benchmark-smoke-${{ matrix.os }}
           path: benchmark-results/
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make fuzz-smoke FUZZ_RUNS=10000 FUZZ_SECONDS=30
+      - run: make PROFILE=asan bin/asan/allocatorSequenceTest CXX=clang++
+      - run: ./bin/asan/allocatorSequenceTest --seed=20261119 --cases=1000
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-corpus-and-failures
+          path: |
+            build/fuzz/corpus/
+            build/fuzz/artifacts/

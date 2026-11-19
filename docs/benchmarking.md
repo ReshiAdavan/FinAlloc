@@ -9,12 +9,12 @@ python3 tools/bench_report.py --output benchmark-results --report-only
 
 The sweep writes raw JSON plus report.md. Rebuilding a report refuses instrumented
 results, non-release profiles, and mixed hosts/build provenance. Use a new output
-directory for each commit, build, or host. Existing files are replaced only for
+directory for each commit, source-content digest, build, or host. Existing files are replaced only for
 the selected configurations; avoid reusing a directory for unrelated sweeps.
 
 `make PROFILE=asan all test`, `make PROFILE=tsan ...`, and release builds use
 separate directories. A build-provenance header changes when flags, compiler
-command, commit, dirty status, or host metadata change, triggering recompilation.
+command, commit, source-content digest, dirty status, or host metadata change, triggering recompilation.
 The compiler version and sanitized status are also recorded by the executable.
 CPU model detection degrades explicitly when sandbox policy hides that information.
 Build metadata identifies the build host; rebuild after copying binaries to a
